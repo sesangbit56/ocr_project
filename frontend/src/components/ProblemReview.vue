@@ -103,16 +103,19 @@
                   </div>
                   <span class="type-tag" :class="content.type">{{ content.type }}</span>
                   <textarea
+                    v-if="content.type !== 'formula'"
                     v-model="content.content"
-                    :rows="content.type === 'formula' ? 5 : 2"
+                    rows="2"
                     class="content-input"
                     :class="content.type"
                   ></textarea>
-                  <div
-                    v-if="content.type === 'formula'"
-                    class="latex-preview"
-                    v-html="renderLatex(content.content)"
-                  ></div>
+                  <math-field
+                    v-else
+                    class="math-field-input"
+                    smart-fence
+                    :value="content.content"
+                    @input="content.content = $event.target.value"
+                  ></math-field>
                 </div>
                 <div class="content-row-tools">
                   <span v-if="isFlagged(content)" class="review-flag">&#9888; needs review</span>
@@ -160,6 +163,10 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import katex from 'katex'
 import 'katex/dist/katex.min.css'
+// Registers the <math-field> custom element used below - an experiment to
+// let the LaTeX source be edited directly through its rendered form,
+// instead of a raw-text textarea next to a read-only KaTeX preview.
+import 'mathlive'
 
 const props = defineProps({
   pageId: {
@@ -868,28 +875,20 @@ watch(() => props.pageId, fetchReview)
   resize: vertical;
 }
 
-.content-input.formula {
-  font-family: 'Cascadia Code', Consolas, monospace;
-  font-size: 1rem;
-  line-height: 1.5;
-}
-
-.latex-preview {
-  flex: 1 1 40%;
+.math-field-input {
+  flex: 1;
   min-width: 8rem;
   min-height: 6rem;
   padding: 0.6rem 0.8rem;
   border: 1px solid #e5e7eb;
   border-radius: 0.4rem;
-  background: #fafafa;
-  overflow: auto;
-  display: flex;
-  align-items: center;
+  background: white;
   font-size: 1.15rem;
 }
 
-.latex-preview :deep(.katex-display) {
-  margin: 0;
+.math-field-input:focus {
+  border-color: #2563eb;
+  outline: none;
 }
 
 .latex-error {
