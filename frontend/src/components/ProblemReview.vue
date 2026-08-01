@@ -23,8 +23,8 @@
           </button>
         </div>
 
-        <div class="review-body">
-          <div class="review-image">
+        <div class="review-body" ref="reviewBodyEl" :class="{ resizing: resizingPanels }">
+          <div class="review-image" :style="{ flexBasis: imagePanelRatio * 100 + '%' }">
             <label class="formula-toggle">
               <input type="checkbox" v-model="showAllFormulas" />
               Show all formula regions
@@ -69,6 +69,8 @@
             </div>
           </div>
 
+          <div class="panel-resize-handle" @mousedown="startPanelResize"></div>
+
           <div class="review-contents">
             <div v-if="currentProblem" class="problem-card">
               <div class="problem-card-header">
@@ -80,60 +82,70 @@
                 {{ currentProblem.status === 'pending' ? 'Recognizing...' : 'Not recognized yet.' }}
               </p>
 
-              <div
-                v-for="(content, cIndex) in currentProblem.contents"
-                :key="content.id"
-                class="content-row"
-                :class="{ 'needs-review': isFlagged(content) }"
-              >
-                <div class="content-row-main">
-                  <div class="order-buttons">
-                    <button
-                      class="order-button"
-                      :disabled="cIndex === 0 || reordering"
-                      title="Move up"
-                      @click="moveContent(currentProblem, cIndex, -1)"
-                    >&#9650;</button>
-                    <button
-                      class="order-button"
-                      :disabled="cIndex === currentProblem.contents.length - 1 || reordering"
-                      title="Move down"
-                      @click="moveContent(currentProblem, cIndex, 1)"
-                    >&#9660;</button>
-                  </div>
-                  <span class="type-tag" :class="content.type">{{ content.type }}</span>
-                  <textarea
-                    v-if="content.type !== 'formula'"
-                    v-model="content.content"
-                    rows="2"
-                    class="content-input"
-                    :class="content.type"
-                  ></textarea>
-                  <math-field
-                    v-else
-                    class="math-field-input"
-                    smart-fence
-                    :value="content.content"
-                    @input="content.content = $event.target.value"
-                  ></math-field>
-                </div>
-                <div class="content-row-tools">
-                  <span v-if="isFlagged(content)" class="review-flag">&#9888; needs review</span>
-                  <button
-                    v-if="content.type === 'formula'"
-                    class="adjust-button"
-                    :disabled="(adjustingContentId && adjustingContentId !== content.id) || (adjustingContentId === content.id && submittingRegion)"
-                    @click="startAdjust(currentProblem, content)"
-                  >
-                    {{
-                      adjustingContentId === content.id
-                        ? (submittingRegion ? 'Saving...' : 'Drawing on image...')
-                        : 'Adjust region'
-                    }}
-                  </button>
-                  <button class="delete-button" @click="deleteContent(currentProblem, content)">Delete</button>
-                </div>
+              <div class="add-content-toolbar">
+                <span class="add-content-label">Fix mis-clustered content:</span>
+                <button class="add-button" :disabled="addingContent" @click="addContent('formula')">+ Formula</button>
+                <button class="add-button" :disabled="addingContent" @click="addContent('text')">+ Text</button>
               </div>
+
+              <div v-if="topLevelContents.length > 0" class="group-toolbar">
+                <input
+                  v-model="groupLabelInput"
+                  type="text"
+                  class="group-label-input"
+                  placeholder="Group label (e.g. 보기)"
+                />
+                <button
+                  class="group-button"
+                  :disabled="selectedContentIds.size === 0 || !groupLabelInput.trim() || grouping"
+                  @click="groupSelected"
+                >
+                  Group selected ({{ selectedContentIds.size }})
+                </button>
+              </div>
+
+              <template v-for="(item, index) in topLevelContents" :key="item.id">
+                <div v-if="item.type === 'group'" class="content-group">
+                  <div class="content-group-header">
+                    <span class="content-group-label">{{ item.label }}</span>
+                    <button class="ungroup-button" @click="ungroupContent(item)">Ungroup</button>
+                  </div>
+                  <ContentRow
+                    v-for="(child, cIndex) in childrenOf(item.id)"
+                    :key="child.id"
+                    :content="child"
+                    :index="cIndex"
+                    :sibling-count="childrenOf(item.id).length"
+                    :reordering="reordering"
+                    :flagged="isFlagged(child)"
+                    :adjusting-content-id="adjustingContentId"
+                    :submitting-region="submittingRegion"
+                    @move="(direction) => moveContent(currentProblem, childrenOf(item.id), cIndex, direction)"
+                    @delete="deleteContent(currentProblem, child)"
+                    @adjust-region="startAdjust(currentProblem, child)"
+                  />
+                </div>
+                <div v-else class="content-row-wrapper">
+                  <input
+                    type="checkbox"
+                    class="select-checkbox"
+                    :checked="selectedContentIds.has(item.id)"
+                    @change="toggleSelected(item.id)"
+                  />
+                  <ContentRow
+                    :content="item"
+                    :index="index"
+                    :sibling-count="topLevelContents.length"
+                    :reordering="reordering"
+                    :flagged="isFlagged(item)"
+                    :adjusting-content-id="adjustingContentId"
+                    :submitting-region="submittingRegion"
+                    @move="(direction) => moveContent(currentProblem, topLevelContents, index, direction)"
+                    @delete="deleteContent(currentProblem, item)"
+                    @adjust-region="startAdjust(currentProblem, item)"
+                  />
+                </div>
+              </template>
             </div>
 
             <div class="slide-controls">
@@ -167,6 +179,7 @@ import 'katex/dist/katex.min.css'
 // let the LaTeX source be edited directly through its rendered form,
 // instead of a raw-text textarea next to a read-only KaTeX preview.
 import 'mathlive'
+import ContentRow from './ContentRow.vue'
 
 const props = defineProps({
   pageId: {
@@ -238,16 +251,40 @@ const onKeydown = (event) => {
 
 // Adjusting a region mid-drag only makes sense for the problem currently on
 // screen, so switching slides cancels it rather than leaving a dangling
-// draft box pointed at a problem the user can no longer see.
+// draft box pointed at a problem the user can no longer see. Same for a
+// pending group selection - it shouldn't carry over onto the next problem.
 watch(currentIndex, () => {
   cancelAdjust()
+  selectedContentIds.value = new Set()
+  groupLabelInput.value = ''
 })
 
-const moveContent = async (problem, index, direction) => {
-  const targetIndex = index + direction
-  if (targetIndex < 0 || targetIndex >= problem.contents.length) return
+// Content forms a two-level tree (top-level rows, plus a type="group" row's
+// children) via parent_content_id, not true nesting in the API response -
+// these derive that view from the flat problem.contents list.
+const topLevelContents = computed(() => {
+  const problem = currentProblem.value
+  if (!problem) return []
+  return problem.contents
+    .filter((c) => !c.parent_content_id)
+    .slice()
+    .sort((a, b) => a.order_index - b.order_index)
+})
 
-  const reordered = problem.contents.slice()
+const childrenOf = (groupId) => {
+  const problem = currentProblem.value
+  if (!problem) return []
+  return problem.contents
+    .filter((c) => c.parent_content_id === groupId)
+    .slice()
+    .sort((a, b) => a.order_index - b.order_index)
+}
+
+const moveContent = async (problem, siblings, index, direction) => {
+  const targetIndex = index + direction
+  if (targetIndex < 0 || targetIndex >= siblings.length) return
+
+  const reordered = siblings.slice()
   const [moved] = reordered.splice(index, 1)
   reordered.splice(targetIndex, 0, moved)
 
@@ -256,7 +293,10 @@ const moveContent = async (problem, index, direction) => {
     const response = await fetch(`/api/problems/${problem.id}/contents/order`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content_ids: reordered.map((c) => c.id) }),
+      body: JSON.stringify({
+        content_ids: reordered.map((c) => c.id),
+        parent_content_id: siblings[index].parent_content_id || null,
+      }),
     })
     const updated = await response.json()
     problem.contents = updated.contents
@@ -269,6 +309,80 @@ const deleteContent = async (problem, content) => {
   const response = await fetch(`/api/problem_contents/${content.id}`, { method: 'DELETE' })
   const updated = await response.json()
   problem.contents = updated.contents
+}
+
+// Manual grouping: boxed sections like <보기> or a (가)/(나) condition list
+// have no detection signal in the current PDF-text-based pipeline (the box
+// border is a vector line, invisible to it), so a reviewer marks one by
+// selecting the rows that belong inside it.
+const selectedContentIds = ref(new Set())
+const groupLabelInput = ref('')
+const grouping = ref(false)
+
+const toggleSelected = (id) => {
+  const next = new Set(selectedContentIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selectedContentIds.value = next
+}
+
+const groupSelected = async () => {
+  const problem = currentProblem.value
+  const label = groupLabelInput.value.trim()
+  if (!problem || selectedContentIds.value.size === 0 || !label) return
+
+  grouping.value = true
+  try {
+    const response = await fetch(`/api/problems/${problem.id}/contents/group`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label, content_ids: Array.from(selectedContentIds.value) }),
+    })
+    const updated = await response.json()
+    problem.contents = updated.contents
+    selectedContentIds.value = new Set()
+    groupLabelInput.value = ''
+  } finally {
+    grouping.value = false
+  }
+}
+
+const ungroupContent = async (group) => {
+  const problem = currentProblem.value
+  if (!problem) return
+  const response = await fetch(`/api/problem_contents/${group.id}/group`, { method: 'DELETE' })
+  const updated = await response.json()
+  problem.contents = updated.contents
+}
+
+// Escape hatch for when clustering merges or splits content wrong (e.g.
+// several multiple-choice options recognized as one formula): add an empty
+// row and let the reviewer place it by hand. A new formula row goes
+// straight into "Adjust region" draw mode since that's the only way to
+// give it real content.
+const addingContent = ref(false)
+
+const addContent = async (type) => {
+  const problem = currentProblem.value
+  if (!problem || addingContent.value) return
+  const previousIds = new Set(problem.contents.map((c) => c.id))
+
+  addingContent.value = true
+  try {
+    const response = await fetch(`/api/problems/${problem.id}/contents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type }),
+    })
+    const updated = await response.json()
+    problem.contents = updated.contents
+    if (type === 'formula') {
+      const created = updated.contents.find((c) => !previousIds.has(c.id))
+      if (created) startAdjust(problem, created)
+    }
+  } finally {
+    addingContent.value = false
+  }
 }
 
 const showAllFormulas = ref(true)
@@ -409,10 +523,19 @@ const stillRecognizing = computed(
   () => !!data.value && data.value.problems.some((p) => p.status === 'pending')
 )
 
-const onImageLoad = () => {
-  if (imgEl.value) {
+// scale is naturalWidth/clientWidth - it depends on how wide the image is
+// actually rendered, which changes whenever the image panel resizes (the
+// draggable divider, or a window resize), not just on initial load. Every
+// box overlay position derives from this, so letting it go stale after a
+// resize is exactly what misaligns them from the real image.
+const updateScale = () => {
+  if (imgEl.value && imgEl.value.clientWidth) {
     scale.value = imgEl.value.naturalWidth / imgEl.value.clientWidth
   }
+}
+
+const onImageLoad = () => {
+  updateScale()
 }
 
 const rectStyle = (bbox) => {
@@ -423,6 +546,37 @@ const rectStyle = (bbox) => {
     width: `${bbox.w * displayScale}px`,
     height: `${bbox.h * displayScale}px`,
   }
+}
+
+// Draggable divider between the image and results panels. The image panel
+// takes this fraction of review-body's width; review-contents fills the
+// rest via flex:1. Resizing it changes image-viewport's size, which the
+// ResizeObserver below already reacts to for the zoom/crop recalculation -
+// no separate wiring needed for the image to keep fitting as you drag.
+const reviewBodyEl = ref(null)
+const imagePanelRatio = ref(0.66)
+const resizingPanels = ref(false)
+const PANEL_RATIO_MIN = 0.25
+const PANEL_RATIO_MAX = 0.8
+
+const onPanelResizeMove = (event) => {
+  const rect = reviewBodyEl.value?.getBoundingClientRect()
+  if (!rect || !rect.width) return
+  const ratio = (event.clientX - rect.left) / rect.width
+  imagePanelRatio.value = Math.min(Math.max(ratio, PANEL_RATIO_MIN), PANEL_RATIO_MAX)
+}
+
+const stopPanelResize = () => {
+  resizingPanels.value = false
+  window.removeEventListener('mousemove', onPanelResizeMove)
+  window.removeEventListener('mouseup', stopPanelResize)
+}
+
+const startPanelResize = (event) => {
+  event.preventDefault()
+  resizingPanels.value = true
+  window.addEventListener('mousemove', onPanelResizeMove)
+  window.addEventListener('mouseup', stopPanelResize)
 }
 
 // Slide view crops/zooms the image to the current problem so its regions
@@ -442,6 +596,7 @@ watch(imageViewportEl, (el) => {
     resizeObserver = new ResizeObserver((entries) => {
       const rect = entries[0]?.contentRect
       if (rect) viewportSize.value = { width: rect.width, height: rect.height }
+      updateScale()
     })
     resizeObserver.observe(el)
   }
@@ -521,7 +676,7 @@ const confirm = async () => {
     const payload = {
       problems: data.value.problems.map((p) => ({
         id: p.id,
-        contents: p.contents.map((c) => ({ id: c.id, content: c.content })),
+        contents: p.contents.map((c) => ({ id: c.id, content: c.content, label: c.label })),
       })),
     }
     const response = await fetch(`/api/pages/${props.pageId}/review`, {
@@ -544,6 +699,8 @@ onUnmounted(() => {
   stopPolling()
   if (resizeObserver) resizeObserver.disconnect()
   window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('mousemove', onPanelResizeMove)
+  window.removeEventListener('mouseup', stopPanelResize)
 })
 watch(() => props.pageId, fetchReview)
 </script>
@@ -618,15 +775,41 @@ watch(() => props.pageId, fetchReview)
 
 .review-body {
   display: flex;
-  gap: 1.25rem;
-  align-items: flex-start;
+  align-items: stretch;
+}
+
+.review-body.resizing {
+  user-select: none;
 }
 
 .review-image {
-  flex: 1.9;
-  min-width: 0;
+  flex: 0 0 auto;
+  min-width: 200px;
   border: 1px solid #e5e7eb;
   border-radius: 0.5rem;
+}
+
+.panel-resize-handle {
+  flex: 0 0 1.25rem;
+  cursor: col-resize;
+  position: relative;
+}
+
+.panel-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 4px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: #e5e7eb;
+}
+
+.panel-resize-handle:hover::after,
+.review-body.resizing .panel-resize-handle::after {
+  background: #93c5fd;
 }
 
 .image-viewport {
@@ -638,6 +821,10 @@ watch(() => props.pageId, fetchReview)
 .image-wrapper {
   position: relative;
   transition: transform 0.25s ease;
+}
+
+.review-body.resizing .image-wrapper {
+  transition: none;
 }
 
 .review-image img {
@@ -766,42 +953,21 @@ watch(() => props.pageId, fetchReview)
   color: #166534;
 }
 
-.content-row {
-  margin-bottom: 0.5rem;
-  padding: 0.4rem;
-  border-radius: 0.4rem;
-  border: 1px solid transparent;
-}
-
-.content-row.needs-review {
-  border-color: #fbbf24;
-  background: #fffbeb;
-}
-
-.content-row-main {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  align-items: flex-start;
-}
-
-.content-row-tools {
+.add-content-toolbar {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
-  margin-top: 0.35rem;
-  padding-left: calc(1.6rem + 4.2rem + 1rem);
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
 }
 
-.review-flag {
+.add-content-label {
   font-size: 0.78rem;
-  color: #92400e;
+  color: #6b7280;
 }
 
-.adjust-button,
-.delete-button {
-  font-size: 0.78rem;
-  padding: 0.25rem 0.55rem;
+.add-button {
+  font-size: 0.8rem;
+  padding: 0.3rem 0.6rem;
   border: 1px solid #d1d5db;
   border-radius: 0.35rem;
   background: white;
@@ -809,86 +975,83 @@ watch(() => props.pageId, fetchReview)
   cursor: pointer;
 }
 
-.adjust-button:disabled {
+.add-button:disabled {
   color: #9ca3af;
   cursor: not-allowed;
 }
 
-.delete-button {
-  color: #b91c1c;
-  border-color: #fecaca;
-}
-
-.order-buttons {
-  flex-shrink: 0;
+.group-toolbar {
   display: flex;
-  flex-direction: column;
-  gap: 0.1rem;
-  width: 1.6rem;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px dashed #e5e7eb;
 }
 
-.order-button {
-  font-size: 0.6rem;
-  line-height: 1;
-  padding: 0.15rem 0;
+.group-label-input {
+  font-size: 0.85rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.4rem;
+  width: 10rem;
+}
+
+.group-button {
+  font-size: 0.8rem;
+  padding: 0.3rem 0.6rem;
   border: 1px solid #d1d5db;
-  border-radius: 0.3rem;
+  border-radius: 0.35rem;
   background: white;
   color: #374151;
   cursor: pointer;
 }
 
-.order-button:disabled {
-  color: #d1d5db;
+.group-button:disabled {
+  color: #9ca3af;
   cursor: not-allowed;
 }
 
-.type-tag {
+.content-row-wrapper {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+}
+
+.select-checkbox {
+  margin-top: 0.9rem;
   flex-shrink: 0;
-  width: 4.2rem;
-  text-align: center;
-  font-size: 0.75rem;
-  padding: 0.3rem 0.3rem;
-  border-radius: 0.4rem;
-  background: #f3f4f6;
-  color: #374151;
 }
 
-.type-tag.formula {
-  background: #fef3c7;
-  color: #92400e;
+.content-group {
+  margin-bottom: 0.5rem;
+  padding: 0.5rem;
+  border: 1px dashed #a5b4fc;
+  border-radius: 0.5rem;
+  background: #eef2ff;
 }
 
-.type-tag.text {
-  background: #e0e7ff;
+.content-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.4rem;
+}
+
+.content-group-label {
+  font-weight: 600;
+  font-size: 0.85rem;
   color: #3730a3;
 }
 
-.content-input {
-  flex: 1;
-  min-width: 0;
-  font-family: inherit;
-  font-size: 0.9rem;
-  padding: 0.4rem 0.55rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 0.4rem;
-  resize: vertical;
-}
-
-.math-field-input {
-  flex: 1;
-  min-width: 8rem;
-  min-height: 6rem;
-  padding: 0.6rem 0.8rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 0.4rem;
+.ungroup-button {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid #c7d2fe;
+  border-radius: 0.35rem;
   background: white;
-  font-size: 1.15rem;
-}
-
-.math-field-input:focus {
-  border-color: #2563eb;
-  outline: none;
+  color: #3730a3;
+  cursor: pointer;
 }
 
 .latex-error {

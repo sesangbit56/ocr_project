@@ -255,8 +255,10 @@ def run_recognition_in_background(document_id):
 def problem_content_to_dict(content):
     return {
         "id": str(content.id),
+        "parent_content_id": str(content.parent_content_id) if content.parent_content_id else None,
         "order_index": content.order_index,
         "type": content.type,
+        "label": content.label,
         "content": content.content,
         "bbox": {
             "x": content.bbox_x,
@@ -324,6 +326,7 @@ def confirm_page_review(page_id):
             content = ProblemContent.query.filter_by(id=content_uuid, problem_id=problem.id).first()
             if content is not None:
                 content.content = content_data.get("content", content.content)
+                content.label = content_data.get("label", content.label)
 
         problem.status = "confirmed"
 
@@ -341,6 +344,14 @@ def confirm_page_review(page_id):
 HANGUL_RE = re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏]")
 FORMULA_CHAR_RE = re.compile(r"[A-Za-z0-9+\-=*/<>≤≥±√∞^_%|(){}\[\]Α-ω①-⑳]")
 NEUTRAL_CHAR_RE = re.compile(r"[\s.,:;!?'\"·…‥]")
+
+# A multiple-choice option ("① 1", "② -2x+3") starts with a circled numeral,
+# which classify_char_type already buckets as a "formula" character since it
+# sits in the same Unicode-range check as digits/operators. Peeling it off
+# here keeps these out of the LaTeX-OCR clustering pass entirely -- the PDF
+# text layer already extracts the plain value correctly, so there's nothing
+# for pix2text to usefully add, only hallucination risk to invite.
+CHOICE_LABEL_RE = re.compile(r"^([①-⑳])\s*(.*)$")
 
 
 def classify_char_type(ch):
@@ -408,6 +419,7 @@ def merge_segments(chars, problem, scale):
         results.append(
             {
                 "type": seg["type"],
+                "label": None,
                 "content": "".join(seg["texts"]).strip(),
                 "bbox_x": int(round(x0 * scale)) - problem.x,
                 "bbox_y": int(round(y0 * scale)) - problem.y,
@@ -417,6 +429,25 @@ def merge_segments(chars, problem, scale):
             }
         )
     return results
+
+
+def extract_choice_labels(segments):
+    """Peel a leading circled numeral off any formula segment into its own
+    label, retyping it "choice" so apply_latex_to_formulas's clustering
+    (which only looks at type == "formula") leaves it untouched."""
+    result = []
+    for seg in segments:
+        if seg["type"] == "formula":
+            match = CHOICE_LABEL_RE.match(seg["content"])
+            if match:
+                seg = {
+                    **seg,
+                    "type": "choice",
+                    "label": match.group(1),
+                    "content": match.group(2),
+                }
+        result.append(seg)
+    return result
 
 
 def recognize_problem_regions(document, page, problem):
@@ -444,6 +475,7 @@ def recognize_problem_regions(document, page, problem):
         return [
             {
                 "type": "text",
+                "label": None,
                 "content": "",
                 "bbox_x": 0,
                 "bbox_y": 0,
@@ -453,6 +485,7 @@ def recognize_problem_regions(document, page, problem):
             },
         ]
 
+    segments = extract_choice_labels(segments)
     return apply_latex_to_formulas(segments, document, page, problem)
 
 
@@ -491,6 +524,68 @@ def clean_latex(latex):
     cleaned = re.sub(r"\{\s*\}", "", cleaned)  # empty groups left behind
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+# pix2text's rendering of a circled-numeral choice marker (①②③④⑤). Some
+# PDFs' fonts don't expose those as real Unicode codepoints in the text
+# layer (mapped instead to garbage like "@"/"®"/stray Katakana), which is
+# why choice-splitting can't rely on extract_choice_labels alone for those
+# documents -- but the OCR model recognizes the circled *shape* correctly
+# regardless of the font, so this catches it after the fact instead.
+CHOICE_MARKER_LATEX = r"\oplus"
+
+
+def split_multi_choice_latex(latex):
+    """If clustering merged several multiple-choice options into one OCR
+    call (recognizable by 2+ \\oplus markers in the result), split it back
+    into one piece per option. Returns None if the pattern doesn't apply,
+    so the caller falls back to treating it as a single formula."""
+    if latex.count(CHOICE_MARKER_LATEX) < 2:
+        return None
+
+    # Split on top-level '&' (cell) and '\\' (row) boundaries of the
+    # aligned/array environment pix2text wraps multi-cell output in --
+    # "top-level" meaning outside any {...} nesting, so a & or \\ inside a
+    # \frac{a}{b} or similar doesn't get mistaken for a real separator.
+    pieces = []
+    current = []
+    depth = 0
+    i = 0
+    while i < len(latex):
+        ch = latex[i]
+        if ch == "{":
+            depth += 1
+            current.append(ch)
+            i += 1
+        elif ch == "}":
+            depth -= 1
+            current.append(ch)
+            i += 1
+        elif depth == 0 and latex[i : i + 2] == "\\\\":
+            pieces.append("".join(current))
+            current = []
+            i += 2
+        elif depth == 0 and ch == "&":
+            pieces.append("".join(current))
+            current = []
+            i += 1
+        else:
+            current.append(ch)
+            i += 1
+    pieces.append("".join(current))
+
+    choices = []
+    for piece in pieces:
+        piece = piece.strip()
+        if piece.startswith("{") and piece.endswith("}"):
+            piece = piece[1:-1].strip()
+        if CHOICE_MARKER_LATEX not in piece:
+            continue
+        cleaned = piece.replace(CHOICE_MARKER_LATEX, "", 1).strip()
+        if cleaned:
+            choices.append(cleaned)
+
+    return choices if len(choices) >= 2 else None
 
 
 def crop_region_image(document, page, x, y, w, h, pad=8, dpi=RENDER_DPI):
@@ -601,26 +696,60 @@ def apply_latex_to_formulas(segments, document, page, problem):
         except Exception:
             latex = segments[anchor]["content"]
 
-        replacements[anchor] = {
-            "type": "formula",
-            "content": latex,
-            "bbox_x": x0,
-            "bbox_y": y0,
-            "bbox_w": x1 - x0,
-            "bbox_h": y1 - y0,
-            "confidence": round(coverage, 2),
-        }
+        bbox = {"bbox_x": x0, "bbox_y": y0, "bbox_w": x1 - x0, "bbox_h": y1 - y0}
+        choices = split_multi_choice_latex(latex)
+        if choices:
+            # All choices share this cluster's one bbox -- there's no way to
+            # recover individual positions after the fact, only the combined
+            # crop that went into OCR. Adjust region still works per-row to
+            # fix that up by hand afterward.
+            replacements[anchor] = [
+                {
+                    "type": "choice",
+                    "label": chr(0x2460 + i) if i < 20 else None,
+                    "content": choice_latex,
+                    "confidence": round(coverage, 2),
+                    **bbox,
+                }
+                for i, choice_latex in enumerate(choices)
+            ]
+        else:
+            replacements[anchor] = [
+                {
+                    "type": "formula",
+                    "label": None,
+                    "content": latex,
+                    "confidence": round(coverage, 2),
+                    **bbox,
+                }
+            ]
         consumed.update(member_idxs)
 
     result = []
     for i, seg in enumerate(segments):
         if i in replacements:
-            result.append(replacements[i])
+            result.extend(replacements[i])
         elif i in consumed:
             continue
         else:
             result.append(seg)
     return result
+
+
+def _content_from_segment(problem_id, segment, parent_content_id, order_index):
+    return ProblemContent(
+        problem_id=problem_id,
+        parent_content_id=parent_content_id,
+        order_index=order_index,
+        type=segment["type"],
+        label=segment.get("label"),
+        content=segment["content"],
+        bbox_x=segment["bbox_x"],
+        bbox_y=segment["bbox_y"],
+        bbox_w=segment["bbox_w"],
+        bbox_h=segment["bbox_h"],
+        confidence=segment["confidence"],
+    )
 
 
 def recognize_and_save_problem(document, page, problem):
@@ -630,20 +759,46 @@ def recognize_and_save_problem(document, page, problem):
 
     ProblemContent.query.filter_by(problem_id=problem.id).delete()
     contents = []
-    for index, segment in enumerate(segments):
-        content = ProblemContent(
-            problem_id=problem.id,
-            order_index=index,
-            type=segment["type"],
-            content=segment["content"],
-            bbox_x=segment["bbox_x"],
-            bbox_y=segment["bbox_y"],
-            bbox_w=segment["bbox_w"],
-            bbox_h=segment["bbox_h"],
-            confidence=segment["confidence"],
-        )
+    top_level_index = 0
+    i = 0
+    while i < len(segments):
+        run_end = i
+        if segments[i]["type"] == "choice":
+            while run_end < len(segments) and segments[run_end]["type"] == "choice":
+                run_end += 1
+
+        # A run of 2+ consecutive choices reads as one multiple-choice set,
+        # not N unrelated rows -- bundle them into a group automatically,
+        # the same way a reviewer would do by hand with "Group selected".
+        # Applies regardless of which path found the choices (extract_
+        # choice_labels peeling them upfront, or split_multi_choice_latex
+        # splitting a merged OCR result apart after the fact). A lone
+        # choice isn't a "set" of anything, so it's left ungrouped.
+        if run_end - i >= 2:
+            group = ProblemContent(
+                problem_id=problem.id,
+                parent_content_id=None,
+                order_index=top_level_index,
+                type="group",
+                label="Choices",
+            )
+            db.session.add(group)
+            db.session.flush()  # need group.id before children can reference it
+            contents.append(group)
+            top_level_index += 1
+
+            for child_index, seg in enumerate(segments[i:run_end]):
+                content = _content_from_segment(problem.id, seg, group.id, child_index)
+                db.session.add(content)
+                contents.append(content)
+            i = run_end
+            continue
+
+        content = _content_from_segment(problem.id, segments[i], None, top_level_index)
         db.session.add(content)
         contents.append(content)
+        top_level_index += 1
+        i += 1
 
     problem.status = "recognized"
     return contents
@@ -661,6 +816,50 @@ def recognize_problem(problem_id):
     db.session.commit()
 
     return jsonify([problem_content_to_dict(c) for c in contents])
+
+
+@app.route("/api/problems/<uuid:problem_id>/contents", methods=["POST"])
+def create_problem_content(problem_id):
+    """Manually add an empty content row -- the escape hatch for when
+    automatic clustering over- or under-merges a region (e.g. several
+    multiple-choice options recognized as one formula): delete the bad row,
+    add one row per option, and Adjust region each into place by hand."""
+    problem = Problem.query.get_or_404(problem_id)
+    data = request.get_json() or {}
+
+    content_type = data.get("type")
+    if content_type not in ("text", "formula"):
+        return jsonify({"error": "type must be 'text' or 'formula'"}), 400
+
+    raw_parent = data.get("parent_content_id")
+    try:
+        parent_content_id = uuid.UUID(str(raw_parent)) if raw_parent else None
+    except (ValueError, TypeError, AttributeError):
+        return jsonify({"error": "parent_content_id must be a UUID or null"}), 400
+
+    if parent_content_id is not None:
+        parent = ProblemContent.query.filter_by(id=parent_content_id, problem_id=problem_id, type="group").first()
+        if parent is None:
+            return jsonify({"error": "parent_content_id must reference a group in this problem"}), 400
+
+    sibling_count = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=parent_content_id).count()
+    content = ProblemContent(
+        problem_id=problem_id,
+        parent_content_id=parent_content_id,
+        order_index=sibling_count,
+        type=content_type,
+        content="",
+        bbox_x=0,
+        bbox_y=0,
+        bbox_w=min(60, problem.w),
+        bbox_h=min(30, problem.h),
+        confidence=1.0,
+    )
+    db.session.add(content)
+    db.session.commit()
+
+    remaining = ProblemContent.query.filter_by(problem_id=problem_id).order_by(ProblemContent.order_index).all()
+    return jsonify(problem_to_dict(problem, remaining)), 201
 
 
 @app.route("/api/problem_contents/<uuid:content_id>/region", methods=["POST"])
@@ -701,21 +900,122 @@ def update_content_region(content_id):
     return jsonify(problem_content_to_dict(content))
 
 
+def _renumber_siblings(problem_id, parent_content_id):
+    """Reassign order_index 0..n-1 among rows sharing the same parent (None
+    for top-level), so structural changes never leave gaps or clashes."""
+    siblings = (
+        ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=parent_content_id)
+        .order_by(ProblemContent.order_index)
+        .all()
+    )
+    for index, c in enumerate(siblings):
+        c.order_index = index
+    return siblings
+
+
+def _ungroup(group):
+    """Reparent a group's children back to top level, appended after the
+    problem's existing top-level rows, preserving their relative order.
+    Does not delete the group row or commit -- caller controls both."""
+    children = (
+        ProblemContent.query.filter_by(parent_content_id=group.id)
+        .order_by(ProblemContent.order_index)
+        .all()
+    )
+    for child in children:
+        child.parent_content_id = None
+    db.session.flush()
+    _renumber_siblings(group.problem_id, None)
+
+
+@app.route("/api/problems/<uuid:problem_id>/contents/group", methods=["POST"])
+def group_problem_contents(problem_id):
+    """Bundle a set of top-level content rows under a new type="group" row
+    (e.g. a <보기> box) with a chosen label. Not auto-detected -- the current
+    pipeline reads only the PDF's text layer, which has no signal for a box
+    border, so this is how a reviewer marks one by hand."""
+    problem = Problem.query.get_or_404(problem_id)
+    data = request.get_json() or {}
+
+    label = (data.get("label") or "").strip()
+    if not label:
+        return jsonify({"error": "label is required"}), 400
+
+    try:
+        content_ids = [uuid.UUID(str(cid)) for cid in data.get("content_ids", [])]
+    except (ValueError, TypeError, AttributeError):
+        return jsonify({"error": "content_ids must be a list of UUIDs"}), 400
+    if not content_ids:
+        return jsonify({"error": "content_ids must not be empty"}), 400
+
+    rows = ProblemContent.query.filter(
+        ProblemContent.id.in_(content_ids), ProblemContent.problem_id == problem_id
+    ).all()
+    if len(rows) != len(content_ids):
+        return jsonify({"error": "content_ids must all belong to this problem"}), 400
+    if any(r.parent_content_id is not None or r.type == "group" for r in rows):
+        return jsonify({"error": "only top-level, non-group content can be grouped"}), 400
+
+    ordered_rows = sorted(rows, key=lambda r: r.order_index)
+    top_level_count = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=None).count()
+
+    group = ProblemContent(
+        problem_id=problem_id,
+        parent_content_id=None,
+        order_index=top_level_count,
+        type="group",
+        label=label,
+    )
+    db.session.add(group)
+    db.session.flush()
+
+    for index, row in enumerate(ordered_rows):
+        row.parent_content_id = group.id
+        row.order_index = index
+    db.session.flush()
+    _renumber_siblings(problem_id, None)
+
+    remaining = ProblemContent.query.filter_by(problem_id=problem_id).order_by(ProblemContent.order_index).all()
+    db.session.commit()
+    return jsonify(problem_to_dict(problem, remaining))
+
+
+@app.route("/api/problem_contents/<uuid:group_id>/group", methods=["DELETE"])
+def ungroup_problem_content(group_id):
+    group = ProblemContent.query.get_or_404(group_id)
+    if group.type != "group":
+        return jsonify({"error": "only group content can be ungrouped"}), 400
+
+    problem_id = group.problem_id
+    _ungroup(group)
+    db.session.delete(group)
+    db.session.flush()
+    _renumber_siblings(problem_id, None)
+
+    remaining = ProblemContent.query.filter_by(problem_id=problem_id).order_by(ProblemContent.order_index).all()
+    db.session.commit()
+    return jsonify(problem_to_dict(Problem.query.get(problem_id), remaining))
+
+
 @app.route("/api/problem_contents/<uuid:content_id>", methods=["DELETE"])
 def delete_problem_content(content_id):
     """Remove a content block outright -- the cleanup step for a stray
     leftover fragment that Adjust region can't get rid of on its own,
     since adjusting a region only ever changes the one block it's called
-    on, never removes a sibling."""
+    on, never removes a sibling. Deleting a group reparents its children
+    back to top level first, rather than orphaning them."""
     content = ProblemContent.query.get_or_404(content_id)
     problem_id = content.problem_id
+    parent_content_id = content.parent_content_id
+
+    if content.type == "group":
+        _ungroup(content)
+
     db.session.delete(content)
     db.session.flush()
+    _renumber_siblings(problem_id, parent_content_id)
 
     remaining = ProblemContent.query.filter_by(problem_id=problem_id).order_by(ProblemContent.order_index).all()
-    for index, c in enumerate(remaining):
-        c.order_index = index
-
     db.session.commit()
     return jsonify(problem_to_dict(Problem.query.get(problem_id), remaining))
 
@@ -730,10 +1030,19 @@ def reorder_problem_contents(problem_id):
     except (ValueError, TypeError, AttributeError):
         return jsonify({"error": "content_ids must be a list of UUIDs"}), 400
 
-    contents = ProblemContent.query.filter_by(problem_id=problem_id).all()
+    raw_parent = data.get("parent_content_id")
+    try:
+        parent_content_id = uuid.UUID(str(raw_parent)) if raw_parent else None
+    except (ValueError, TypeError, AttributeError):
+        return jsonify({"error": "parent_content_id must be a UUID or null"}), 400
+
+    # Scoped to siblings sharing the same parent, not every content row in
+    # the problem -- a group's children reorder independently of whatever
+    # else is at the top level (and vice versa).
+    contents = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=parent_content_id).all()
     by_id = {c.id: c for c in contents}
     if set(by_id.keys()) != set(ordered_ids):
-        return jsonify({"error": "content_ids must match this problem's existing contents exactly"}), 400
+        return jsonify({"error": "content_ids must match this parent's existing contents exactly"}), 400
 
     for index, content_id in enumerate(ordered_ids):
         by_id[content_id].order_index = index

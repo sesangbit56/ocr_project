@@ -98,8 +98,14 @@ class ProblemContent(db.Model):
 
     id = db.Column(Uuid, primary_key=True, default=uuid.uuid4)
     problem_id = db.Column(Uuid, db.ForeignKey("problems.id"), nullable=False)
+    # Self-referential: set when this row is nested inside a type="group" row
+    # (e.g. a <보기> box). Top-level content (most rows) leaves this null.
+    parent_content_id = db.Column(Uuid, db.ForeignKey("problem_contents.id"), nullable=True)
     order_index = db.Column(db.Integer)
     type = db.Column(db.Text)
+    # Visible marker for a structured item: "①", "ㄱ", "(가)", or a group's
+    # own heading like "보기". Null for plain stem text/formula rows.
+    label = db.Column(db.Text)
     content = db.Column(db.Text)
     bbox_x = db.Column(db.Integer)
     bbox_y = db.Column(db.Integer)
