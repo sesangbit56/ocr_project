@@ -104,7 +104,7 @@
                   <span class="type-tag" :class="content.type">{{ content.type }}</span>
                   <textarea
                     v-model="content.content"
-                    rows="2"
+                    :rows="content.type === 'formula' ? 5 : 2"
                     class="content-input"
                     :class="content.type"
                   ></textarea>
@@ -870,19 +870,22 @@ watch(() => props.pageId, fetchReview)
 
 .content-input.formula {
   font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 1rem;
+  line-height: 1.5;
 }
 
 .latex-preview {
   flex: 1 1 40%;
   min-width: 8rem;
-  min-height: 2.4rem;
-  padding: 0.4rem 0.6rem;
+  min-height: 6rem;
+  padding: 0.6rem 0.8rem;
   border: 1px solid #e5e7eb;
   border-radius: 0.4rem;
   background: #fafafa;
-  overflow-x: auto;
+  overflow: auto;
   display: flex;
   align-items: center;
+  font-size: 1.15rem;
 }
 
 .latex-preview :deep(.katex-display) {
