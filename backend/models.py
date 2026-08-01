@@ -112,3 +112,7 @@ class ProblemContent(db.Model):
     bbox_w = db.Column(db.Integer)
     bbox_h = db.Column(db.Integer)
     confidence = db.Column(db.Float)
+    # Set for type="image" content once a region has been drawn for it -
+    # path to the cropped diagram/graph image, same pattern as Problem's own
+    # crop_path.
+    crop_path = db.Column(db.Text)

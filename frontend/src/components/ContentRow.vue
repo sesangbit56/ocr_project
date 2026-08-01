@@ -30,6 +30,10 @@
         class="content-input"
         :class="content.type"
       ></textarea>
+      <div v-else-if="content.type === 'image'" class="image-preview">
+        <img v-if="content.image_url" :src="content.image_url" alt="" />
+        <span v-else class="image-preview-placeholder">Adjust region to crop the image</span>
+      </div>
       <math-field
         v-else
         class="math-field-input"
@@ -41,7 +45,7 @@
     <div class="content-row-tools">
       <span v-if="flagged" class="review-flag">&#9888; needs review</span>
       <button
-        v-if="content.type === 'formula'"
+        v-if="content.type === 'formula' || content.type === 'image' || content.type === 'choice'"
         class="adjust-button"
         :disabled="(adjustingContentId && adjustingContentId !== content.id) || (adjustingContentId === content.id && submittingRegion)"
         @click="$emit('adjust-region')"
@@ -174,6 +178,11 @@ defineEmits(['move', 'delete', 'adjust-region'])
   color: #065f46;
 }
 
+.type-tag.image {
+  background: #fce7f3;
+  color: #9d174d;
+}
+
 .label-input {
   flex-shrink: 0;
   width: 3.6rem;
@@ -209,5 +218,30 @@ defineEmits(['move', 'delete', 'adjust-region'])
 .math-field-input:focus {
   border-color: #2563eb;
   outline: none;
+}
+
+.image-preview {
+  flex: 1;
+  min-width: 8rem;
+  min-height: 6rem;
+  padding: 0.5rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.4rem;
+  background: #fafafa;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.image-preview img {
+  max-width: 100%;
+  max-height: 16rem;
+  display: block;
+}
+
+.image-preview-placeholder {
+  font-size: 0.85rem;
+  color: #9ca3af;
+  text-align: center;
 }
 </style>

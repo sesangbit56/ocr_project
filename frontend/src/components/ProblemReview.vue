@@ -4,6 +4,7 @@
       <button class="back-button" @click="$emit('back')">&larr; Back to page</button>
       <h2 v-if="data">Review problems &mdash; Page {{ data.page_number }}</h2>
       <span v-if="allConfirmed" class="badge">All reviewed</span>
+      <button class="guide-link" @click="$emit('guide')">사용법</button>
     </div>
 
     <p v-if="loading" class="info">Loading...</p>
@@ -27,12 +28,12 @@
           <div class="review-image" :style="{ flexBasis: imagePanelRatio * 100 + '%' }">
             <label class="formula-toggle">
               <input type="checkbox" v-model="showAllFormulas" />
-              Show all formula regions
+              Show all recognized regions
             </label>
             <p v-if="adjustingContentId" class="adjust-banner">
               <template v-if="submittingRegion">Saving new region&hellip;</template>
               <template v-else>
-                Drag a box around the correct region for this formula.
+                Drag a box around the correct region for this item.
                 <button class="cancel-adjust-button" @click="cancelAdjust">Cancel</button>
               </template>
             </p>
@@ -61,7 +62,7 @@
                   v-for="box in formulaBoxes"
                   :key="`formula-${box.id}`"
                   class="rect-box formula-box"
-                  :class="{ flagged: box.flagged }"
+                  :class="{ flagged: box.flagged, 'image-box': box.type === 'image' }"
                   :style="rectStyle(box)"
                 ></div>
                 <div v-if="draft" class="rect-box draft" :style="rectStyle(draft)"></div>
@@ -83,9 +84,11 @@
               </p>
 
               <div class="add-content-toolbar">
-                <span class="add-content-label">Fix mis-clustered content:</span>
+                <span class="add-content-label">Add a block:</span>
                 <button class="add-button" :disabled="addingContent" @click="addContent('formula')">+ Formula</button>
                 <button class="add-button" :disabled="addingContent" @click="addContent('text')">+ Text</button>
+                <button class="add-button" :disabled="addingContent" @click="addContent('choice')">+ Choice</button>
+                <button class="add-button" :disabled="addingContent" @click="addContent('image')">+ Image</button>
               </div>
 
               <div v-if="topLevelContents.length > 0" class="group-toolbar">
@@ -107,6 +110,20 @@
               <template v-for="(item, index) in topLevelContents" :key="item.id">
                 <div v-if="item.type === 'group'" class="content-group">
                   <div class="content-group-header">
+                    <div v-if="!isChoicesGroup(item)" class="group-order-buttons">
+                      <button
+                        class="order-button"
+                        :disabled="index === 0 || reordering"
+                        title="Move up"
+                        @click="moveContent(currentProblem, topLevelContents, index, -1)"
+                      >&#9650;</button>
+                      <button
+                        class="order-button"
+                        :disabled="index >= topLevelOrderableCount - 1 || reordering"
+                        title="Move down"
+                        @click="moveContent(currentProblem, topLevelContents, index, 1)"
+                      >&#9660;</button>
+                    </div>
                     <span class="content-group-label">{{ item.label }}</span>
                     <button class="ungroup-button" @click="ungroupContent(item)">Ungroup</button>
                   </div>
@@ -135,7 +152,7 @@
                   <ContentRow
                     :content="item"
                     :index="index"
-                    :sibling-count="topLevelContents.length"
+                    :sibling-count="topLevelOrderableCount"
                     :reordering="reordering"
                     :flagged="isFlagged(item)"
                     :adjusting-content-id="adjustingContentId"
@@ -271,6 +288,21 @@ const topLevelContents = computed(() => {
     .sort((a, b) => a.order_index - b.order_index)
 })
 
+// The auto-created multiple-choice group always sorts last (enforced
+// server-side too - see _is_pinned_last), so it isn't part of the
+// reorderable sequence: no move buttons of its own, and it's excluded from
+// the "how many movable siblings are there" count other items' down-arrows
+// use to know when they'd be trying to move past it.
+const isChoicesGroup = (item) => item.type === 'group' && item.label === 'Choices'
+
+const topLevelOrderableCount = computed(() => {
+  const list = topLevelContents.value
+  if (list.length > 0 && isChoicesGroup(list[list.length - 1])) {
+    return list.length - 1
+  }
+  return list.length
+})
+
 const childrenOf = (groupId) => {
   const problem = currentProblem.value
   if (!problem) return []
@@ -376,7 +408,7 @@ const addContent = async (type) => {
     })
     const updated = await response.json()
     problem.contents = updated.contents
-    if (type === 'formula') {
+    if (type === 'formula' || type === 'image' || type === 'choice') {
       const created = updated.contents.find((c) => !previousIds.has(c.id))
       if (created) startAdjust(problem, created)
     }
@@ -392,11 +424,12 @@ const formulaBoxes = computed(() => {
   if (!problem) return []
   const boxes = []
   for (const content of problem.contents) {
-    if (content.type !== 'formula') continue
+    if (content.type !== 'formula' && content.type !== 'image') continue
     const flagged = isFlagged(content)
     if (!showAllFormulas.value && !flagged) continue
     boxes.push({
       id: content.id,
+      type: content.type,
       x: problem.bbox.x + content.bbox.x,
       y: problem.bbox.y + content.bbox.y,
       w: content.bbox.w,
@@ -499,12 +532,13 @@ const submitAdjustedRegion = async () => {
       body: JSON.stringify(region),
     })
     const updated = await response.json()
-    for (const problem of data.value.problems) {
-      const idx = problem.contents.findIndex((c) => c.id === contentId)
-      if (idx !== -1) {
-        problem.contents[idx] = updated
-        break
-      }
+    // Full problem, not just the one content row - adjusting an image's
+    // region can delete other rows it now covers server-side (see the
+    // /region endpoint), so the whole contents list needs replacing, not
+    // just the one entry we started the request for.
+    const problem = data.value.problems.find((p) => p.id === updated.id)
+    if (problem) {
+      problem.contents = updated.contents
     }
   } finally {
     submittingRegion.value = false
@@ -728,6 +762,16 @@ watch(() => props.pageId, fetchReview)
   padding: 0;
 }
 
+.guide-link {
+  border: 1px solid #d1d5db;
+  background: white;
+  color: #374151;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.65rem;
+  border-radius: 0.4rem;
+}
+
 .badge {
   font-size: 0.85rem;
   padding: 0.25rem 0.6rem;
@@ -864,6 +908,11 @@ watch(() => props.pageId, fetchReview)
 .rect-box.formula-box.flagged {
   border: 2px dashed #d97706;
   background: rgba(217, 119, 6, 0.12);
+}
+
+.rect-box.formula-box.image-box {
+  border: 2px dashed #db2777;
+  background: rgba(219, 39, 119, 0.08);
 }
 
 .rect-box.draft {
@@ -1034,14 +1083,39 @@ watch(() => props.pageId, fetchReview)
 .content-group-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 0.5rem;
   margin-bottom: 0.4rem;
 }
 
 .content-group-label {
+  flex: 1;
   font-weight: 600;
   font-size: 0.85rem;
   color: #3730a3;
+}
+
+.group-order-buttons {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  width: 1.6rem;
+}
+
+.group-order-buttons .order-button {
+  font-size: 0.6rem;
+  line-height: 1;
+  padding: 0.15rem 0;
+  border: 1px solid #c7d2fe;
+  border-radius: 0.3rem;
+  background: white;
+  color: #3730a3;
+  cursor: pointer;
+}
+
+.group-order-buttons .order-button:disabled {
+  color: #c7d2fe;
+  cursor: not-allowed;
 }
 
 .ungroup-button {

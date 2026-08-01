@@ -2,9 +2,11 @@ import os
 import re
 import shutil
 import threading
+import time
 import uuid
 
 import fitz
+import numpy as np
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from PIL import Image
@@ -185,6 +187,30 @@ def crop_problem_image(document, page, problem):
     return f"{page.document_id}/problems/{crop_name}"
 
 
+def crop_content_image(document, page, content, x, y, w, h):
+    """Same idea as crop_problem_image, one level down: crop a single
+    type="image" content block's region (e.g. a graph or diagram) straight
+    from the source PDF and save it as its own file. x/y/w/h are absolute
+    page-pixel coordinates (already offset by the problem's own position)."""
+    contents_dir = os.path.join(upload_dir, str(page.document_id), "contents")
+    os.makedirs(contents_dir, exist_ok=True)
+    crop_name = f"{content.id}.png"
+    crop_abs = os.path.join(contents_dir, crop_name)
+
+    scale = RENDER_DPI / 72
+    pdf_path = os.path.join(upload_dir, document.file_path)
+    pdf = fitz.open(pdf_path)
+    try:
+        pdf_page = pdf[page.page_number - 1]
+        rect = fitz.Rect(x / scale, y / scale, (x + w) / scale, (y + h) / scale)
+        pixmap = pdf_page.get_pixmap(clip=rect, dpi=RENDER_DPI)
+        pixmap.save(crop_abs)
+    finally:
+        pdf.close()
+
+    return f"{page.document_id}/contents/{crop_name}"
+
+
 @app.route("/api/pages/<uuid:page_id>/problems", methods=["POST"])
 def save_page_problems(page_id):
     page = Page.query.get_or_404(page_id)
@@ -260,6 +286,10 @@ def problem_content_to_dict(content):
         "type": content.type,
         "label": content.label,
         "content": content.content,
+        # Cache-busted: the underlying file can be overwritten in place by a
+        # later region adjustment while the path itself stays the same, and
+        # an unchanged <img src> won't re-fetch on its own otherwise.
+        "image_url": f"/api/files/{content.crop_path}?t={time.time()}" if content.crop_path else None,
         "bbox": {
             "x": content.bbox_x,
             "y": content.bbox_y,
@@ -432,12 +462,16 @@ def merge_segments(chars, problem, scale):
 
 
 def extract_choice_labels(segments):
-    """Peel a leading circled numeral off any formula segment into its own
-    label, retyping it "choice" so apply_latex_to_formulas's clustering
-    (which only looks at type == "formula") leaves it untouched."""
+    """Peel a leading circled numeral off a formula or text segment into its
+    own label, retyping it "choice". Checks both types because the two
+    detection paths disagree on which one a circled numeral lands in: the
+    PDF-text-layer char classifier buckets ①-⑳ as "formula" characters (so
+    apply_latex_to_formulas's clustering, which only looks at type ==
+    "formula", would otherwise sweep them into OCR), while pix2text's
+    scanned-page layout analysis calls them "text" instead."""
     result = []
     for seg in segments:
-        if seg["type"] == "formula":
+        if seg["type"] in ("formula", "text"):
             match = CHOICE_LABEL_RE.match(seg["content"])
             if match:
                 seg = {
@@ -450,11 +484,99 @@ def extract_choice_labels(segments):
     return result
 
 
+def _rows_overlap(a, b):
+    """Two segments sit on the same visual row if their vertical spans
+    overlap by more than half of the shorter one's height."""
+    ay0, ay1 = a["bbox_y"], a["bbox_y"] + a["bbox_h"]
+    by0, by1 = b["bbox_y"], b["bbox_y"] + b["bbox_h"]
+    overlap = min(ay1, by1) - max(ay0, by0)
+    return overlap > 0.5 * min(a["bbox_h"], b["bbox_h"])
+
+
+def _merge_boxes(*segs):
+    x0 = min(s["bbox_x"] for s in segs)
+    y0 = min(s["bbox_y"] for s in segs)
+    x1 = max(s["bbox_x"] + s["bbox_w"] for s in segs)
+    y1 = max(s["bbox_y"] + s["bbox_h"] for s in segs)
+    return {"bbox_x": x0, "bbox_y": y0, "bbox_w": x1 - x0, "bbox_h": y1 - y0}
+
+
+def merge_empty_choice_markers(segments):
+    """pix2text sometimes detects a circled-numeral marker as its own box,
+    separate from its value (e.g. "③" alone, with "3√3" as an unrelated
+    following formula box). extract_choice_labels already recognizes the
+    marker itself (label="③", content="" since there's nothing else in that
+    box) but leaves the value stranded as the next segment -- merge a
+    content-less choice into whatever immediately follows it on the same
+    row instead of leaving one empty and the other orphaned."""
+    result = []
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        if seg["type"] == "choice" and not seg["content"].strip() and i + 1 < len(segments):
+            nxt = segments[i + 1]
+            if _rows_overlap(seg, nxt):
+                result.append({**nxt, "type": "choice", "label": seg["label"], **_merge_boxes(seg, nxt)})
+                i += 2
+                continue
+        result.append(seg)
+        i += 1
+    return result
+
+
+def relabel_choice_row(segments):
+    """If a row already has at least one confirmed choice (a circled
+    numeral OCR happened to read correctly), the rest of that row is almost
+    certainly more choices whose marker OCR got wrong -- pix2text misreads
+    ①/⑤ as "®" indiscriminately, for instance, so the same wrong glyph can't
+    even be mapped back to which number it was. That's a safe row to act on
+    specifically because we already have positive evidence it's a choice
+    row, unlike guessing from a bare short-text-before-formula shape
+    anywhere on the page. Absorbs those into choices too (self-contained
+    marker+value in one box, like "@3", or a bare marker that needs the
+    next segment as its value, like the empty "③" case above) and
+    renumbers every choice on the row ①②③... by left-to-right position, so
+    a garbled marker glyph never survives into the saved label."""
+    anchors = [s for s in segments if s["type"] == "choice"]
+    if not anchors:
+        return segments
+    anchor = anchors[0]
+
+    result = list(segments)
+    i = 0
+    while i < len(result) - 1:
+        cur, nxt = result[i], result[i + 1]
+        if cur["type"] != "text" or len(cur["content"].strip()) > 3 or not _rows_overlap(cur, anchor):
+            i += 1
+            continue
+
+        digit_match = re.match(r"^\D*(\d.*)$", cur["content"].strip())
+        if digit_match:
+            # Marker and value already fused in one box (e.g. "@3" ~ "②3");
+            # keep only the value, drop the unrecognizable marker prefix.
+            result[i] = {**cur, "type": "choice", "label": None, "content": digit_match.group(1)}
+            i += 1
+        elif _rows_overlap(cur, nxt):
+            # Bare marker glyph with nothing else in its box; the value is
+            # the next segment on the same row.
+            result[i] = {**nxt, "type": "choice", "label": None, **_merge_boxes(cur, nxt)}
+            del result[i + 1]
+        else:
+            i += 1
+
+    ordered = sorted((i for i, s in enumerate(result) if s["type"] == "choice"), key=lambda i: result[i]["bbox_x"])
+    for position, idx in enumerate(ordered):
+        if position < 20:
+            result[idx] = {**result[idx], "label": chr(0x2460 + position)}
+    return result
+
+
 def recognize_problem_regions(document, page, problem):
     """Split a problem's region into formula/text segments using the PDF's
     native text layer, classifying by Unicode range (Hangul vs Latin/math).
-    Falls back to a single placeholder segment if the page has no
-    extractable text layer (e.g. a scanned image)."""
+    Falls back to recognize_scanned_problem_region when the page has no
+    extractable text layer at all (e.g. a scanned PDF, where every "page" is
+    really just one embedded raster image)."""
     scale = RENDER_DPI / 72
     pdf_path = os.path.join(upload_dir, document.file_path)
     pdf = fitz.open(pdf_path)
@@ -472,18 +594,7 @@ def recognize_problem_regions(document, page, problem):
 
     segments = merge_segments(chars, problem, scale)
     if not segments:
-        return [
-            {
-                "type": "text",
-                "label": None,
-                "content": "",
-                "bbox_x": 0,
-                "bbox_y": 0,
-                "bbox_w": problem.w,
-                "bbox_h": problem.h,
-                "confidence": None,
-            },
-        ]
+        return recognize_scanned_problem_region(problem)
 
     segments = extract_choice_labels(segments)
     return apply_latex_to_formulas(segments, document, page, problem)
@@ -502,6 +613,117 @@ def get_formula_ocr_model():
 
         _formula_ocr_model = Pix2Text.from_config()
     return _formula_ocr_model
+
+
+_text_ocr_reader = None
+
+
+def get_text_ocr_reader():
+    """Lazily load EasyOCR's Korean+English reader, cached the same way as
+    the formula model. Downloads its own model weights on first use."""
+    global _text_ocr_reader
+    if _text_ocr_reader is None:
+        import easyocr
+
+        _text_ocr_reader = easyocr.Reader(["ko", "en"], gpu=False)
+    return _text_ocr_reader
+
+
+def recognize_scanned_problem_region(problem):
+    """Recognize a problem's region straight from its already-cropped image,
+    for when there's no PDF text layer to drive the usual char-classification
+    pipeline (a scanned page -- every "page" is really one embedded raster
+    image with zero extractable text).
+
+    pix2text's combined text+formula analysis reads the page directly, so
+    it doesn't need a text layer either, and it detects layout (where the
+    text/formula regions are) reliably. Its formula recognition is likewise
+    reliable. But its own text-line reading isn't tuned for Hangul -- it
+    handles digits/Latin/symbols fine and mangles Korean words into
+    unrelated-looking garbage. So layout and formula content come from
+    pix2text; each detected *text* region is re-cropped and re-read with
+    EasyOCR instead, which actually reads Korean correctly.
+
+    Circled-numeral choice markers (①②③...) are a further wrinkle: they
+    usually aren't in a general OCR model's character set at all, so
+    pix2text tends to misread one as some unrelated symbol rather than
+    dropping it -- and it's not even a consistent misreading (① and ⑤ can
+    both come out as "®"), so it can't be corrected with a lookup table.
+    merge_empty_choice_markers/relabel_choice_row recover this positionally
+    instead: once at least one marker on a row was read correctly, the rest
+    of that row is almost certainly more choices, so they get relabeled
+    ①②③... by left-to-right position regardless of what OCR actually saw.
+    The label field is still hand-editable per row as a fallback for
+    whatever this doesn't catch (e.g. a row with no correct reads at all)."""
+    img = Image.open(os.path.join(upload_dir, problem.crop_path)).convert("RGB")
+
+    formula_model = get_formula_ocr_model()
+    boxes = formula_model.recognize_text_formula(img, return_text=False)
+
+    text_reader = None
+    segments = []
+    for box in boxes:
+        position = box["position"]
+        x0 = int(round(min(p[0] for p in position)))
+        y0 = int(round(min(p[1] for p in position)))
+        x1 = int(round(max(p[0] for p in position)))
+        y1 = int(round(max(p[1] for p in position)))
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        if box["type"] in ("isolated", "embedding"):
+            content = clean_latex(str(box["text"]).strip())
+            seg_type = "formula"
+            confidence = float(box["score"])
+        else:
+            if text_reader is None:
+                text_reader = get_text_ocr_reader()
+            crop = img.crop((x0, y0, x1, y1))
+            reads = text_reader.readtext(np.array(crop))
+            content = " ".join(t.strip() for _, t, c in reads if t.strip())
+            confidence = (sum(c for _, _, c in reads) / len(reads)) if reads else 0.0
+            seg_type = "text"
+            if not content.strip():
+                # EasyOCR's character set doesn't include circled-numeral
+                # choice markers (①②③...), so a box that's mostly/only one
+                # comes back empty. pix2text's own guess for it, imperfect
+                # as it can be, beats silently dropping the option entirely.
+                content = str(box["text"]).strip()
+                confidence = float(box["score"])
+
+        if not content.strip():
+            continue
+
+        segments.append(
+            {
+                "type": seg_type,
+                "label": None,
+                "content": content,
+                "bbox_x": x0,
+                "bbox_y": y0,
+                "bbox_w": x1 - x0,
+                "bbox_h": y1 - y0,
+                "confidence": round(confidence, 2),
+            }
+        )
+
+    if not segments:
+        return [
+            {
+                "type": "text",
+                "label": None,
+                "content": "",
+                "bbox_x": 0,
+                "bbox_y": 0,
+                "bbox_w": problem.w,
+                "bbox_h": problem.h,
+                "confidence": None,
+            },
+        ]
+
+    segments = extract_choice_labels(segments)
+    segments = merge_empty_choice_markers(segments)
+    return relabel_choice_row(segments)
 
 
 # Tokens pix2text occasionally hallucinates into otherwise-correct output --
@@ -828,8 +1050,8 @@ def create_problem_content(problem_id):
     data = request.get_json() or {}
 
     content_type = data.get("type")
-    if content_type not in ("text", "formula"):
-        return jsonify({"error": "type must be 'text' or 'formula'"}), 400
+    if content_type not in ("text", "formula", "choice", "image"):
+        return jsonify({"error": "type must be 'text', 'formula', 'choice', or 'image'"}), 400
 
     raw_parent = data.get("parent_content_id")
     try:
@@ -856,22 +1078,48 @@ def create_problem_content(problem_id):
         confidence=1.0,
     )
     db.session.add(content)
-    db.session.commit()
+    db.session.flush()
+    # Keeps a new row from landing after the choices group -- it would
+    # otherwise, since that group already counts toward sibling_count above.
+    _renumber_siblings(problem_id, parent_content_id)
 
     remaining = ProblemContent.query.filter_by(problem_id=problem_id).order_by(ProblemContent.order_index).all()
+    db.session.commit()
     return jsonify(problem_to_dict(problem, remaining)), 201
+
+
+def _containment_ratio(outer, inner):
+    """Fraction of inner's area that falls within outer. Both are dicts
+    with x/y/w/h in the same (problem-relative) coordinate space."""
+    ox0, oy0, ox1, oy1 = outer["x"], outer["y"], outer["x"] + outer["w"], outer["y"] + outer["h"]
+    ix0, iy0, ix1, iy1 = inner["x"], inner["y"], inner["x"] + inner["w"], inner["y"] + inner["h"]
+    overlap_w = max(0, min(ox1, ix1) - max(ox0, ix0))
+    overlap_h = max(0, min(oy1, iy1) - max(oy0, iy0))
+    inner_area = inner["w"] * inner["h"]
+    return (overlap_w * overlap_h) / inner_area if inner_area > 0 else 0
+
+
+# How much of another content block's area a new image region needs to
+# cover before that block is treated as "this is what the image already
+# shows" and removed, rather than a coincidental partial overlap.
+IMAGE_OVERLAP_DELETE_THRESHOLD = 0.7
 
 
 @app.route("/api/problem_contents/<uuid:content_id>/region", methods=["POST"])
 def update_content_region(content_id):
-    """Manually override a formula's crop region and re-run LaTeX OCR on it.
-    The safety net for cases automatic clustering can't get right -- e.g. a
-    symbol drawn as vector graphics with no extractable text at all, so
-    there's nothing in the PDF's text layer to tell clustering where its
-    bounding box even is."""
+    """Manually override a content block's region. For a formula or choice,
+    re-runs LaTeX OCR on the new crop -- the safety net for cases automatic
+    clustering can't get right (e.g. a symbol drawn as vector graphics with
+    no extractable text, so there's nothing in the PDF's text layer to tell
+    clustering where its bounding box even is). For an image, just saves
+    the crop -- a diagram/graph isn't run through any recognition, it's
+    shown as-is -- and deletes whatever other content rows the new region
+    substantially covers: a diagram's own axis labels/coordinates otherwise
+    tend to get picked up separately as stray text/formula fragments
+    duplicating what the image crop already shows."""
     content = ProblemContent.query.get_or_404(content_id)
-    if content.type != "formula":
-        return jsonify({"error": "only formula content can have its region adjusted"}), 400
+    if content.type not in ("formula", "choice", "image"):
+        return jsonify({"error": "only formula, choice, or image content can have its region adjusted"}), 400
 
     problem = Problem.query.get(content.problem_id)
     page = Page.query.get(problem.page_id)
@@ -885,29 +1133,65 @@ def update_content_region(content_id):
     if w <= 0 or h <= 0:
         return jsonify({"error": "w and h must be positive"}), 400
 
-    model = get_formula_ocr_model()
-    img = crop_region_image(document, page, problem.x + x, problem.y + y, w, h)
-    latex = clean_latex(model.recognize_formula(img).strip())
+    if content.type == "image":
+        content.crop_path = crop_content_image(document, page, content, problem.x + x, problem.y + y, w, h)
+    else:
+        model = get_formula_ocr_model()
+        img = crop_region_image(document, page, problem.x + x, problem.y + y, w, h)
+        content.content = clean_latex(model.recognize_formula(img).strip())
 
     content.bbox_x = x
     content.bbox_y = y
     content.bbox_w = w
     content.bbox_h = h
-    content.content = latex
     content.confidence = 1.0
+    db.session.flush()
 
+    if content.type == "image":
+        candidates = ProblemContent.query.filter(
+            ProblemContent.problem_id == problem.id,
+            ProblemContent.id != content.id,
+            ProblemContent.type != "group",
+        ).all()
+        affected_parents = set()
+        for other in candidates:
+            if not other.bbox_w or not other.bbox_h:
+                continue
+            ratio = _containment_ratio(
+                {"x": x, "y": y, "w": w, "h": h},
+                {"x": other.bbox_x, "y": other.bbox_y, "w": other.bbox_w, "h": other.bbox_h},
+            )
+            if ratio >= IMAGE_OVERLAP_DELETE_THRESHOLD:
+                affected_parents.add(other.parent_content_id)
+                db.session.delete(other)
+        db.session.flush()
+        for parent_id in affected_parents:
+            _renumber_siblings(problem.id, parent_id)
+
+    remaining = ProblemContent.query.filter_by(problem_id=problem.id).order_by(ProblemContent.order_index).all()
     db.session.commit()
-    return jsonify(problem_content_to_dict(content))
+    return jsonify(problem_to_dict(problem, remaining))
+
+
+def _is_pinned_last(content):
+    """The auto-created multiple-choice group always sorts after everything
+    else at its level -- a set of answer options reads as the end of the
+    problem, not something that belongs wherever clustering happened to
+    place it (or wherever a manual reorder of its siblings pushes it)."""
+    return content.type == "group" and content.label == "Choices"
 
 
 def _renumber_siblings(problem_id, parent_content_id):
     """Reassign order_index 0..n-1 among rows sharing the same parent (None
-    for top-level), so structural changes never leave gaps or clashes."""
+    for top-level), so structural changes never leave gaps or clashes. Pins
+    any choices group to the end first (stable sort, so it's the only thing
+    this can reorder -- everything else keeps its relative order)."""
     siblings = (
         ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=parent_content_id)
         .order_by(ProblemContent.order_index)
         .all()
     )
+    siblings.sort(key=lambda c: 1 if _is_pinned_last(c) else 0)
     for index, c in enumerate(siblings):
         c.order_index = index
     return siblings
@@ -1046,7 +1330,10 @@ def reorder_problem_contents(problem_id):
 
     for index, content_id in enumerate(ordered_ids):
         by_id[content_id].order_index = index
-
+    db.session.flush()
+    # Re-pins the choices group last even if the requested order tried to
+    # move something past it -- see _is_pinned_last.
+    _renumber_siblings(problem_id, parent_content_id)
     db.session.commit()
 
     contents_sorted = ProblemContent.query.filter_by(problem_id=problem_id).order_by(ProblemContent.order_index).all()

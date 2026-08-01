@@ -16,10 +16,13 @@
     />
 
     <ProblemReview
-      v-else
+      v-else-if="view === 'review'"
       :page-id="selectedPageId"
       @back="backToViewer"
+      @guide="openGuide"
     />
+
+    <ReviewGuide v-else @back="backFromGuide" />
   </main>
 </template>
 
@@ -29,6 +32,7 @@ import DocumentUpload from './components/DocumentUpload.vue'
 import DocumentList from './components/DocumentList.vue'
 import PageViewer from './components/PageViewer.vue'
 import ProblemReview from './components/ProblemReview.vue'
+import ReviewGuide from './components/ReviewGuide.vue'
 
 const view = ref('list')
 const documents = ref([])
@@ -65,6 +69,14 @@ const openReview = (pageId) => {
 const backToViewer = () => {
   selectedPageId.value = null
   view.value = 'viewer'
+}
+
+const openGuide = () => {
+  view.value = 'guide'
+}
+
+const backFromGuide = () => {
+  view.value = 'review'
 }
 
 onMounted(fetchDocuments)
