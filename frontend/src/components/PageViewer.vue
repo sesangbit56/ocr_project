@@ -4,6 +4,7 @@
       <button class="back-button" @click="$emit('back')">&larr; Back to list</button>
       <h2>{{ doc?.filename }}</h2>
       <span v-if="doc?.status === 'selection_completed'" class="badge">Selection completed</span>
+      <button class="print-preview-button" @click="$emit('print', props.documentId)">Print Preview</button>
     </div>
 
     <div v-if="doc" class="viewer-body">
@@ -12,52 +13,34 @@
           v-for="page in doc.pages"
           :key="page.id"
           class="page-nav-item"
-          :class="{ active: page.id === currentPage?.id, completed: page.status === 'completed' }"
+          :class="{
+            active: page.id === currentPage?.id,
+            reviewed: page.status === 'completed' && page.reviewed,
+            'needs-review': page.status === 'completed' && !page.reviewed,
+          }"
           @click="goToPage(page)"
         >
           Page {{ page.page_number }}
-          <span v-if="page.status === 'completed'" class="check">&#10003;</span>
+          <span v-if="page.status === 'completed' && page.reviewed" class="check" title="Reviewed">&#10003;</span>
+          <span
+            v-else-if="page.status === 'completed' && !page.reviewed"
+            class="review-dot"
+            title="Needs review"
+          ></span>
         </button>
       </aside>
 
       <section v-if="currentPage" class="page-content">
-        <template v-if="currentPage.status !== 'completed'">
-          <div
-            class="image-wrapper"
-            @mousedown="startDraw"
-            @mousemove="onDraw"
-            @mouseup="endDraw"
-            @mouseleave="cancelDraw"
-          >
-            <img
-              ref="imgEl"
-              :src="currentPage.image_url"
-              class="page-image"
-              draggable="false"
-              @load="onImageLoad"
-              @dragstart.prevent
-            />
-            <div
-              v-for="(rect, index) in rectangles"
-              :key="index"
-              class="rect-box"
-              :style="rectStyle(rect)"
-            >
-              <button class="rect-delete" @click.stop="removeRect(index)">&times;</button>
-            </div>
-            <div v-if="draft" class="rect-box draft" :style="rectStyle(draft)"></div>
-          </div>
-
-          <div class="page-actions">
-            <p>{{ rectangles.length }} problem(s) marked</p>
-            <button class="complete-button" :disabled="submitting" @click="complete">
-              {{ submitting ? 'Saving...' : 'Complete' }}
-            </button>
-          </div>
-        </template>
+        <RegionEditor
+          v-if="currentPage.status !== 'completed'"
+          :page="currentPage"
+          @completed="onRegionCompleted"
+        />
 
         <div v-else class="page-actions">
           <p class="info">This page's selections are already completed.</p>
+          <span v-if="currentPage.reviewed" class="review-status reviewed">&#10003; Reviewed</span>
+          <span v-else class="review-status needs-review">&#9679; Needs review</span>
           <button class="review-button" @click="$emit('review', currentPage.id)">
             Review problems
           </button>
@@ -69,6 +52,7 @@
 
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue'
+import RegionEditor from './RegionEditor.vue'
 
 const props = defineProps({
   documentId: {
@@ -77,17 +61,10 @@ const props = defineProps({
   },
 })
 
-const emit = defineEmits(['back', 'changed', 'review'])
+const emit = defineEmits(['back', 'changed', 'review', 'print'])
 
 const doc = ref(null)
 const currentPageId = ref(null)
-const rectangles = ref([])
-const draft = ref(null)
-const startPoint = ref(null)
-const drawing = ref(false)
-const submitting = ref(false)
-const imgEl = ref(null)
-const scale = ref(1)
 
 const currentPage = computed(
   () => doc.value?.pages.find((p) => p.id === currentPageId.value) || null
@@ -103,99 +80,24 @@ const fetchDocument = async () => {
 
 const goToPage = (page) => {
   currentPageId.value = page.id
-  rectangles.value = []
-  draft.value = null
 }
 
-const onImageLoad = () => {
-  if (imgEl.value) {
-    scale.value = imgEl.value.naturalWidth / imgEl.value.clientWidth
-  }
-}
+// RegionEditor owns the drawing state itself (rectangles/draft/etc.) and
+// resets it on its own when the page prop changes - this only needs to
+// fold the save result back into the document-level page list and decide
+// where to go next.
+const onRegionCompleted = (result) => {
+  const completedPageId = currentPage.value.id
+  const page = doc.value.pages.find((p) => p.id === completedPageId)
+  if (page) page.status = result.page.status
+  doc.value.status = result.document_status
+  emit('changed')
 
-const pointFromEvent = (event) => {
-  const bounds = imgEl.value.getBoundingClientRect()
-  return {
-    x: (event.clientX - bounds.left) * scale.value,
-    y: (event.clientY - bounds.top) * scale.value,
-  }
-}
-
-const startDraw = (event) => {
-  if (!currentPage.value || currentPage.value.status === 'completed') return
-  event.preventDefault()
-  const point = pointFromEvent(event)
-  drawing.value = true
-  startPoint.value = point
-  draft.value = { x: point.x, y: point.y, w: 0, h: 0 }
-}
-
-const onDraw = (event) => {
-  if (!drawing.value || !startPoint.value) return
-  const point = pointFromEvent(event)
-  draft.value = {
-    x: Math.min(startPoint.value.x, point.x),
-    y: Math.min(startPoint.value.y, point.y),
-    w: Math.abs(point.x - startPoint.value.x),
-    h: Math.abs(point.y - startPoint.value.y),
-  }
-}
-
-const endDraw = () => {
-  if (drawing.value && draft.value && draft.value.w > 5 && draft.value.h > 5) {
-    rectangles.value.push({ ...draft.value })
-  }
-  drawing.value = false
-  draft.value = null
-  startPoint.value = null
-}
-
-const cancelDraw = () => {
-  drawing.value = false
-  draft.value = null
-  startPoint.value = null
-}
-
-const removeRect = (index) => {
-  rectangles.value.splice(index, 1)
-}
-
-const rectStyle = (rect) => {
-  const displayScale = 1 / scale.value
-  return {
-    left: `${rect.x * displayScale}px`,
-    top: `${rect.y * displayScale}px`,
-    width: `${rect.w * displayScale}px`,
-    height: `${rect.h * displayScale}px`,
-  }
-}
-
-const complete = async () => {
-  if (!currentPage.value) return
-  submitting.value = true
-  try {
-    const response = await fetch(`/api/pages/${currentPage.value.id}/problems`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rectangles: rectangles.value }),
-    })
-    if (!response.ok) throw new Error('Failed to save')
-    const result = await response.json()
-    const completedPageId = currentPage.value.id
-    const page = doc.value.pages.find((p) => p.id === completedPageId)
-    if (page) page.status = result.page.status
-    doc.value.status = result.document_status
-    rectangles.value = []
-    emit('changed')
-
-    const completedIndex = doc.value.pages.findIndex((p) => p.id === completedPageId)
-    const nextPage =
-      doc.value.pages.slice(completedIndex + 1).find((p) => p.status !== 'completed') ||
-      doc.value.pages.find((p) => p.status !== 'completed')
-    if (nextPage) goToPage(nextPage)
-  } finally {
-    submitting.value = false
-  }
+  const completedIndex = doc.value.pages.findIndex((p) => p.id === completedPageId)
+  const nextPage =
+    doc.value.pages.slice(completedIndex + 1).find((p) => p.status !== 'completed') ||
+    doc.value.pages.find((p) => p.status !== 'completed')
+  if (nextPage) goToPage(nextPage)
 }
 
 onMounted(fetchDocument)
@@ -204,7 +106,6 @@ watch(
   () => {
     doc.value = null
     currentPageId.value = null
-    rectangles.value = []
     fetchDocument()
   }
 )
@@ -241,6 +142,16 @@ watch(
   color: #166534;
 }
 
+.print-preview-button {
+  font-size: 0.85rem;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid #d1d5db;
+  border-radius: 0.4rem;
+  background: white;
+  color: #374151;
+  cursor: pointer;
+}
+
 .viewer-body {
   display: flex;
   gap: 1.5rem;
@@ -271,12 +182,39 @@ watch(
   color: #2563eb;
 }
 
-.page-nav-item.completed {
+.page-nav-item.reviewed {
   color: #166534;
+}
+
+.page-nav-item.needs-review {
+  color: #b45309;
 }
 
 .check {
   color: #16a34a;
+}
+
+.review-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: #f59e0b;
+}
+
+.review-status {
+  font-size: 0.85rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 999px;
+}
+
+.review-status.reviewed {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.review-status.needs-review {
+  background: #fef3c7;
+  color: #b45309;
 }
 
 .page-content {
@@ -284,66 +222,11 @@ watch(
   min-width: 0;
 }
 
-.image-wrapper {
-  position: relative;
-  display: inline-block;
-  user-select: none;
-  cursor: crosshair;
-  max-width: 100%;
-}
-
-.page-image {
-  display: block;
-  max-width: 100%;
-  user-select: none;
-}
-
-.rect-box {
-  position: absolute;
-  border: 2px solid #ef4444;
-  background: rgba(239, 68, 68, 0.15);
-  pointer-events: none;
-}
-
-.rect-box.draft {
-  border-style: dashed;
-}
-
-.rect-delete {
-  position: absolute;
-  top: -0.6rem;
-  right: -0.6rem;
-  width: 1.2rem;
-  height: 1.2rem;
-  line-height: 1;
-  border-radius: 50%;
-  border: none;
-  background: #ef4444;
-  color: white;
-  cursor: pointer;
-  pointer-events: auto;
-  font-size: 0.8rem;
-}
-
 .page-actions {
   margin-top: 1rem;
   display: flex;
   align-items: center;
   gap: 1rem;
-}
-
-.complete-button {
-  padding: 0.6rem 1.1rem;
-  border: none;
-  border-radius: 0.5rem;
-  background: #16a34a;
-  color: white;
-  cursor: pointer;
-}
-
-.complete-button:disabled {
-  background: #86efac;
-  cursor: not-allowed;
 }
 
 .review-button {

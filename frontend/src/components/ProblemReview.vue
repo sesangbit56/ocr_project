@@ -24,8 +24,8 @@
           </button>
         </div>
 
-        <div class="review-body" ref="reviewBodyEl" :class="{ resizing: resizingPanels }">
-          <div class="review-image" :style="{ flexBasis: imagePanelRatio * 100 + '%' }">
+        <div class="review-body">
+          <div class="review-panel review-image">
             <label class="formula-toggle">
               <input type="checkbox" v-model="showAllFormulas" />
               Show all recognized regions
@@ -70,99 +70,143 @@
             </div>
           </div>
 
-          <div class="panel-resize-handle" @mousedown="startPanelResize"></div>
-
-          <div class="review-contents">
+          <div class="review-panel review-contents" ref="reviewContentsEl">
             <div v-if="currentProblem" class="problem-card">
-              <div class="problem-card-header">
-                <span class="problem-title">Problem {{ currentIndex + 1 }}</span>
-                <span class="status-tag" :class="currentProblem.status">{{ currentProblem.status }}</span>
+              <div class="problem-card-sticky">
+                <div class="problem-card-header">
+                  <span class="problem-title">Problem {{ currentIndex + 1 }}</span>
+                  <span class="status-tag" :class="currentProblem.status">{{ currentProblem.status }}</span>
+                </div>
+
+                <div class="add-content-toolbar">
+                  <span class="add-content-label">Add a block:</span>
+                  <button class="add-button" :disabled="addingContent" @click="addContent('formula')">+ Formula</button>
+                  <button class="add-button" :disabled="addingContent" @click="addContent('text')">+ Text</button>
+                  <button class="add-button" :disabled="addingContent" @click="addContent('choice')">+ Choice</button>
+                  <button class="add-button" :disabled="addingContent" @click="addContent('image')">+ Image</button>
+                </div>
+
+                <div v-if="topLevelContents.length > 0" class="group-toolbar">
+                  <select v-model="groupLabelPreset" class="group-label-select">
+                    <option v-for="preset in GROUP_LABEL_PRESETS" :key="preset" :value="preset">{{ preset }}</option>
+                    <option value="other">Other</option>
+                  </select>
+                  <input
+                    v-if="groupLabelPreset === 'other'"
+                    v-model="groupLabelCustom"
+                    type="text"
+                    class="group-label-input"
+                    placeholder="Group label (e.g. 보기)"
+                  />
+                  <button
+                    class="group-button"
+                    :disabled="selectedContentIds.size === 0 || !effectiveGroupLabel || grouping"
+                    @click="groupSelected"
+                  >
+                    Group selected ({{ selectedContentIds.size }})
+                  </button>
+                </div>
               </div>
 
               <p v-if="currentProblem.contents.length === 0" class="info small">
                 {{ currentProblem.status === 'pending' ? 'Recognizing...' : 'Not recognized yet.' }}
               </p>
 
-              <div class="add-content-toolbar">
-                <span class="add-content-label">Add a block:</span>
-                <button class="add-button" :disabled="addingContent" @click="addContent('formula')">+ Formula</button>
-                <button class="add-button" :disabled="addingContent" @click="addContent('text')">+ Text</button>
-                <button class="add-button" :disabled="addingContent" @click="addContent('choice')">+ Choice</button>
-                <button class="add-button" :disabled="addingContent" @click="addContent('image')">+ Image</button>
-              </div>
-
-              <div v-if="topLevelContents.length > 0" class="group-toolbar">
-                <input
-                  v-model="groupLabelInput"
-                  type="text"
-                  class="group-label-input"
-                  placeholder="Group label (e.g. 보기)"
-                />
-                <button
-                  class="group-button"
-                  :disabled="selectedContentIds.size === 0 || !groupLabelInput.trim() || grouping"
-                  @click="groupSelected"
-                >
-                  Group selected ({{ selectedContentIds.size }})
-                </button>
-              </div>
-
               <template v-for="(item, index) in topLevelContents" :key="item.id">
-                <div v-if="item.type === 'group'" class="content-group">
-                  <div class="content-group-header">
-                    <div v-if="!isChoicesGroup(item)" class="group-order-buttons">
-                      <button
-                        class="order-button"
-                        :disabled="index === 0 || reordering"
-                        title="Move up"
-                        @click="moveContent(currentProblem, topLevelContents, index, -1)"
-                      >&#9650;</button>
-                      <button
-                        class="order-button"
-                        :disabled="index >= topLevelOrderableCount - 1 || reordering"
-                        title="Move down"
-                        @click="moveContent(currentProblem, topLevelContents, index, 1)"
-                      >&#9660;</button>
+                <template v-if="!isChoicesGroup(item)">
+                  <div v-if="item.type === 'group'" class="content-group">
+                    <div class="content-group-header">
+                      <div class="group-order-buttons">
+                        <button
+                          class="order-button"
+                          :disabled="index === 0 || reordering"
+                          title="Move up"
+                          @click="moveContent(currentProblem, topLevelContents, index, -1)"
+                        >&#9650;</button>
+                        <button
+                          class="order-button"
+                          :disabled="index >= topLevelOrderableCount - 1 || reordering"
+                          title="Move down"
+                          @click="moveContent(currentProblem, topLevelContents, index, 1)"
+                        >&#9660;</button>
+                      </div>
+                      <span class="content-group-label">{{ item.label }}</span>
+                      <button class="ungroup-button" @click="ungroupContent(item)">Ungroup</button>
                     </div>
-                    <span class="content-group-label">{{ item.label }}</span>
-                    <button class="ungroup-button" @click="ungroupContent(item)">Ungroup</button>
+                    <ContentRow
+                      v-for="child in childrenOf(item.id)"
+                      :key="child.id"
+                      :content="child"
+                      :reordering="reordering"
+                      :flagged="isFlagged(child)"
+                      :adjusting-content-id="adjustingContentId"
+                      :submitting-region="submittingRegion"
+                      :drag-over="dragOverId === child.id"
+                      :changing-type="changingType"
+                      @delete="deleteContent(currentProblem, child)"
+                      @adjust-region="startAdjust(currentProblem, child)"
+                      @type-change="onTypeChange(currentProblem, child, $event)"
+                      @drag-start="onDragStart(child, $event)"
+                      @drag-over="onDragOver(child)"
+                      @drag-leave="onDragLeave(child)"
+                      @drop="onDrop(child, childrenOf(item.id))"
+                      @drag-end="onDragEnd"
+                    />
                   </div>
-                  <ContentRow
-                    v-for="(child, cIndex) in childrenOf(item.id)"
-                    :key="child.id"
-                    :content="child"
-                    :index="cIndex"
-                    :sibling-count="childrenOf(item.id).length"
-                    :reordering="reordering"
-                    :flagged="isFlagged(child)"
-                    :adjusting-content-id="adjustingContentId"
-                    :submitting-region="submittingRegion"
-                    @move="(direction) => moveContent(currentProblem, childrenOf(item.id), cIndex, direction)"
-                    @delete="deleteContent(currentProblem, child)"
-                    @adjust-region="startAdjust(currentProblem, child)"
-                  />
-                </div>
-                <div v-else class="content-row-wrapper">
-                  <input
-                    type="checkbox"
-                    class="select-checkbox"
-                    :checked="selectedContentIds.has(item.id)"
-                    @change="toggleSelected(item.id)"
-                  />
-                  <ContentRow
-                    :content="item"
-                    :index="index"
-                    :sibling-count="topLevelOrderableCount"
-                    :reordering="reordering"
-                    :flagged="isFlagged(item)"
-                    :adjusting-content-id="adjustingContentId"
-                    :submitting-region="submittingRegion"
-                    @move="(direction) => moveContent(currentProblem, topLevelContents, index, direction)"
-                    @delete="deleteContent(currentProblem, item)"
-                    @adjust-region="startAdjust(currentProblem, item)"
-                  />
-                </div>
+                  <div
+                    v-else
+                    class="content-row-wrapper"
+                    :class="{ selected: selectedContentIds.has(item.id) }"
+                    @click="onRowClick(item.id, $event)"
+                  >
+                    <input
+                      type="checkbox"
+                      class="select-checkbox"
+                      :checked="selectedContentIds.has(item.id)"
+                      @change="toggleSelected(item.id)"
+                    />
+                    <ContentRow
+                      :content="item"
+                      :reordering="reordering"
+                      :flagged="isFlagged(item)"
+                      :adjusting-content-id="adjustingContentId"
+                      :submitting-region="submittingRegion"
+                      :drag-over="dragOverId === item.id"
+                      :changing-type="changingType"
+                      @delete="deleteContent(currentProblem, item)"
+                      @adjust-region="startAdjust(currentProblem, item)"
+                      @type-change="onTypeChange(currentProblem, item, $event)"
+                      @drag-start="onDragStart(item, $event)"
+                      @drag-over="onDragOver(item)"
+                      @drag-leave="onDragLeave(item)"
+                      @drop="onDrop(item, topLevelContents)"
+                      @drag-end="onDragEnd"
+                    />
+                  </div>
+                </template>
               </template>
+            </div>
+
+            <div v-if="choicesGroup" class="choices-block">
+              <div class="choices-block-header">
+                <span class="choices-block-label">{{ choicesGroup.label }}</span>
+              </div>
+              <div class="choices-grid">
+                <ContentRow
+                  v-for="child in sortedChoiceChildren"
+                  :key="child.id"
+                  :content="child"
+                  compact
+                  :sortable="false"
+                  :flagged="isFlagged(child)"
+                  :adjusting-content-id="adjustingContentId"
+                  :submitting-region="submittingRegion"
+                  :changing-type="changingType"
+                  @delete="deleteContent(currentProblem, child)"
+                  @adjust-region="startAdjust(currentProblem, child)"
+                  @type-change="onTypeChange(currentProblem, child, $event)"
+                />
+              </div>
             </div>
 
             <div class="slide-controls">
@@ -174,6 +218,11 @@
                 @click="nextProblem"
               >Next &rarr;</button>
             </div>
+          </div>
+
+          <div class="review-panel print-preview-box">
+            <div class="print-preview-box-header">Preview</div>
+            <ProblemPrintout v-if="currentProblem" :problem="currentProblem" />
           </div>
         </div>
       </template>
@@ -197,6 +246,7 @@ import 'katex/dist/katex.min.css'
 // instead of a raw-text textarea next to a read-only KaTeX preview.
 import 'mathlive'
 import ContentRow from './ContentRow.vue'
+import ProblemPrintout from './ProblemPrintout.vue'
 
 const props = defineProps({
   pageId: {
@@ -204,6 +254,7 @@ const props = defineProps({
     required: true,
   },
 })
+const emit = defineEmits(['back', 'guide', 'switch-page', 'done'])
 
 const renderLatex = (latex) => {
   if (!latex || !latex.trim()) return ''
@@ -273,7 +324,8 @@ const onKeydown = (event) => {
 watch(currentIndex, () => {
   cancelAdjust()
   selectedContentIds.value = new Set()
-  groupLabelInput.value = ''
+  groupLabelPreset.value = 'Choices'
+  groupLabelCustom.value = ''
 })
 
 // Content forms a two-level tree (top-level rows, plus a type="group" row's
@@ -295,6 +347,11 @@ const topLevelContents = computed(() => {
 // use to know when they'd be trying to move past it.
 const isChoicesGroup = (item) => item.type === 'group' && item.label === 'Choices'
 
+// Rendered as its own compact block below the problem card rather than
+// inline with the rest of the content tree (see the template) - option
+// rows read better as a small side-by-side grid than as full-width rows.
+const choicesGroup = computed(() => topLevelContents.value.find(isChoicesGroup) || null)
+
 const topLevelOrderableCount = computed(() => {
   const list = topLevelContents.value
   if (list.length > 0 && isChoicesGroup(list[list.length - 1])) {
@@ -312,6 +369,66 @@ const childrenOf = (groupId) => {
     .sort((a, b) => a.order_index - b.order_index)
 }
 
+// Choice tiles order themselves by their picked label (①-⑤) rather than by
+// drag position - there's exactly one correct order for a set of answer
+// options, so deriving it from the label removes a step instead of asking
+// the reviewer to also drag each one into place after assigning it.
+// Unlabeled/unrecognized labels sort after the labeled ones, stably.
+const CHOICE_LABEL_ORDER = ['①', '②', '③', '④', '⑤']
+const choiceLabelRank = (label) => {
+  const i = CHOICE_LABEL_ORDER.indexOf(label)
+  return i === -1 ? CHOICE_LABEL_ORDER.length : i
+}
+const sortedChoiceChildren = computed(() => {
+  if (!choicesGroup.value) return []
+  return childrenOf(choicesGroup.value.id).sort((a, b) => choiceLabelRank(a.label) - choiceLabelRank(b.label))
+})
+
+// content/label edits live only in local reactive state until Confirm is
+// clicked (type is not - see onTypeChange). Several actions (reorder,
+// delete, group, ungroup, polling) replace problem.contents wholesale with
+// a fresh server response afterward, which would silently discard those
+// edits on every other row unless carried forward here.
+//
+// Exception: content specifically (not label) defers to the server while a
+// row is processing - it's a placeholder the reviewer can't have
+// meaningfully hand-edited yet, and preserving it would overwrite a
+// background OCR result with the stale placeholder the moment it finishes.
+// Label has nothing to do with that job, so it's kept local either way -
+// picking a choice's label while it's still recognizing shouldn't get
+// silently reverted by the next poll.
+const withLocalEdits = (problem, serverContents) => {
+  const localById = new Map(problem.contents.map((c) => [c.id, c]))
+  return serverContents.map((c) => {
+    const local = localById.get(c.id)
+    if (!local) return c
+    return {
+      ...c,
+      content: local.processing ? c.content : local.content,
+      label: local.label,
+      display_mode: local.display_mode,
+    }
+  })
+}
+
+const commitOrder = async (problem, parentContentId, reordered) => {
+  reordering.value = true
+  try {
+    const response = await fetch(`/api/problems/${problem.id}/contents/order`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content_ids: reordered.map((c) => c.id),
+        parent_content_id: parentContentId,
+      }),
+    })
+    const updated = await response.json()
+    problem.contents = withLocalEdits(problem, updated.contents)
+  } finally {
+    reordering.value = false
+  }
+}
+
 const moveContent = async (problem, siblings, index, direction) => {
   const targetIndex = index + direction
   if (targetIndex < 0 || targetIndex >= siblings.length) return
@@ -320,27 +437,144 @@ const moveContent = async (problem, siblings, index, direction) => {
   const [moved] = reordered.splice(index, 1)
   reordered.splice(targetIndex, 0, moved)
 
-  reordering.value = true
-  try {
-    const response = await fetch(`/api/problems/${problem.id}/contents/order`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        content_ids: reordered.map((c) => c.id),
-        parent_content_id: siblings[index].parent_content_id || null,
-      }),
-    })
-    const updated = await response.json()
-    problem.contents = updated.contents
-  } finally {
-    reordering.value = false
+  await commitOrder(problem, siblings[index].parent_content_id || null, reordered)
+}
+
+// Drag-and-drop reordering for content rows (top-level items and a group's
+// children each drag within their own sibling list - dragOverId/draggingId
+// are global, but a drop only takes effect if the source id is actually
+// found in the target's sibling array, which naturally keeps drags scoped
+// to the list they started in).
+const draggingId = ref(null)
+const dragOverId = ref(null)
+const reviewContentsEl = ref(null)
+
+// The content list scrolls internally (max-height + overflow-y), so once a
+// dragged row nears its top/bottom edge the list needs to auto-scroll -
+// native HTML5 drag doesn't do this for inner scroll containers on its own,
+// only for the page itself. Tracked via a plain (non-reactive) rAF loop
+// rather than refs since it needs to run every frame regardless of Vue's
+// reactivity, and is torn down on dragend so it never outlives the drag.
+const AUTO_SCROLL_EDGE = 60
+const AUTO_SCROLL_MAX_SPEED = 14
+let autoScrollDelta = 0
+let autoScrollRaf = null
+
+const runAutoScroll = () => {
+  if (!autoScrollDelta || !reviewContentsEl.value) {
+    autoScrollRaf = null
+    return
   }
+  reviewContentsEl.value.scrollTop += autoScrollDelta
+  autoScrollRaf = requestAnimationFrame(runAutoScroll)
+}
+
+// Listens on window rather than the list itself so the tracked position
+// stays accurate even while the pointer passes over the image panel or a
+// gap between rows - dragover still bubbles there regardless of whether
+// anything called preventDefault on it.
+const onWindowDragOver = (event) => {
+  const el = reviewContentsEl.value
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  const y = event.clientY
+  // Clamped to 0 rather than gated on >= 0: overshooting past an edge
+  // (easy to do while dragging fast, especially past the top edge which
+  // sits right under the sticky header) should keep scrolling at max
+  // speed, not cancel it the instant the cursor leaves the container.
+  if (y < rect.top + AUTO_SCROLL_EDGE) {
+    const dist = Math.max(y - rect.top, 0)
+    autoScrollDelta = -AUTO_SCROLL_MAX_SPEED * (1 - dist / AUTO_SCROLL_EDGE)
+  } else if (y > rect.bottom - AUTO_SCROLL_EDGE) {
+    const dist = Math.max(rect.bottom - y, 0)
+    autoScrollDelta = AUTO_SCROLL_MAX_SPEED * (1 - dist / AUTO_SCROLL_EDGE)
+  } else {
+    autoScrollDelta = 0
+  }
+  if (autoScrollDelta && !autoScrollRaf) {
+    autoScrollRaf = requestAnimationFrame(runAutoScroll)
+  }
+}
+
+const stopAutoScroll = () => {
+  autoScrollDelta = 0
+  if (autoScrollRaf) {
+    cancelAnimationFrame(autoScrollRaf)
+    autoScrollRaf = null
+  }
+  window.removeEventListener('dragover', onWindowDragOver)
+}
+
+const onDragStart = (item, event) => {
+  draggingId.value = item.id
+  event.dataTransfer.effectAllowed = 'move'
+  event.dataTransfer.setData('text/plain', item.id)
+  const row = event.target.closest('.content-row')
+  if (row) event.dataTransfer.setDragImage(row, 16, 16)
+  window.addEventListener('dragover', onWindowDragOver)
+}
+
+const onDragOver = (item) => {
+  if (!draggingId.value || draggingId.value === item.id) return
+  dragOverId.value = item.id
+}
+
+const onDragLeave = (item) => {
+  if (dragOverId.value === item.id) dragOverId.value = null
+}
+
+const onDrop = async (targetItem, siblings) => {
+  const sourceId = draggingId.value
+  dragOverId.value = null
+  draggingId.value = null
+  if (!sourceId || sourceId === targetItem.id) return
+
+  const sourceIndex = siblings.findIndex((c) => c.id === sourceId)
+  const targetIndex = siblings.findIndex((c) => c.id === targetItem.id)
+  if (sourceIndex === -1 || targetIndex === -1) return
+
+  const reordered = siblings.slice()
+  const [moved] = reordered.splice(sourceIndex, 1)
+  reordered.splice(targetIndex, 0, moved)
+
+  await commitOrder(currentProblem.value, siblings[sourceIndex].parent_content_id || null, reordered)
+}
+
+const onDragEnd = () => {
+  draggingId.value = null
+  dragOverId.value = null
+  stopAutoScroll()
 }
 
 const deleteContent = async (problem, content) => {
   const response = await fetch(`/api/problem_contents/${content.id}`, { method: 'DELETE' })
   const updated = await response.json()
-  problem.contents = updated.contents
+  problem.contents = withLocalEdits(problem, updated.contents)
+}
+
+// Switching a row to/from type="choice" has to move it in or out of the
+// Choices group too (the compact choices block renders that group's
+// children as-is, whatever their type), so unlike content/label edits this
+// isn't a local-only change deferred to Confirm - it goes straight to the
+// server, which owns the reparenting, and the response replaces
+// problem.contents outright so the row's new group membership is reflected
+// immediately.
+const changingType = ref(false)
+
+const onTypeChange = async (problem, content, newType) => {
+  if (content.type === newType) return
+  changingType.value = true
+  try {
+    const response = await fetch(`/api/problem_contents/${content.id}/type`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: newType }),
+    })
+    const updated = await response.json()
+    problem.contents = withLocalEdits(problem, updated.contents)
+  } finally {
+    changingType.value = false
+  }
 }
 
 // Manual grouping: boxed sections like <보기> or a (가)/(나) condition list
@@ -348,7 +582,12 @@ const deleteContent = async (problem, content) => {
 // border is a vector line, invisible to it), so a reviewer marks one by
 // selecting the rows that belong inside it.
 const selectedContentIds = ref(new Set())
-const groupLabelInput = ref('')
+const GROUP_LABEL_PRESETS = ['Choices', 'Options']
+const groupLabelPreset = ref('Choices')
+const groupLabelCustom = ref('')
+const effectiveGroupLabel = computed(() =>
+  groupLabelPreset.value === 'other' ? groupLabelCustom.value.trim() : groupLabelPreset.value
+)
 const grouping = ref(false)
 
 const toggleSelected = (id) => {
@@ -358,9 +597,20 @@ const toggleSelected = (id) => {
   selectedContentIds.value = next
 }
 
+// Lets clicking anywhere on a row's background toggle its selection (the
+// checkbox alone is a tiny target), while clicks meant to edit or act on
+// the row's own controls - the label select, content textarea/math-field,
+// adjust/delete/order buttons - pass through untouched.
+const ROW_CLICK_IGNORE_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'MATH-FIELD'])
+const onRowClick = (id, event) => {
+  if (ROW_CLICK_IGNORE_TAGS.has(event.target.tagName)) return
+  if (event.target.closest('math-field') || event.target.closest('.drag-handle')) return
+  toggleSelected(id)
+}
+
 const groupSelected = async () => {
   const problem = currentProblem.value
-  const label = groupLabelInput.value.trim()
+  const label = effectiveGroupLabel.value
   if (!problem || selectedContentIds.value.size === 0 || !label) return
 
   grouping.value = true
@@ -371,9 +621,10 @@ const groupSelected = async () => {
       body: JSON.stringify({ label, content_ids: Array.from(selectedContentIds.value) }),
     })
     const updated = await response.json()
-    problem.contents = updated.contents
+    problem.contents = withLocalEdits(problem, updated.contents)
     selectedContentIds.value = new Set()
-    groupLabelInput.value = ''
+    groupLabelPreset.value = 'Choices'
+    groupLabelCustom.value = ''
   } finally {
     grouping.value = false
   }
@@ -384,7 +635,7 @@ const ungroupContent = async (group) => {
   if (!problem) return
   const response = await fetch(`/api/problem_contents/${group.id}/group`, { method: 'DELETE' })
   const updated = await response.json()
-  problem.contents = updated.contents
+  problem.contents = withLocalEdits(problem, updated.contents)
 }
 
 // Escape hatch for when clustering merges or splits content wrong (e.g.
@@ -538,8 +789,12 @@ const submitAdjustedRegion = async () => {
     // just the one entry we started the request for.
     const problem = data.value.problems.find((p) => p.id === updated.id)
     if (problem) {
-      problem.contents = updated.contents
+      problem.contents = withLocalEdits(problem, updated.contents)
     }
+    // Formula/choice regions run OCR in the background (see /region) and
+    // come back with processing: true - resume polling so the result gets
+    // picked up once it's done, same as initial recognition.
+    startPollingIfNeeded()
   } finally {
     submittingRegion.value = false
     cancelAdjust()
@@ -554,7 +809,9 @@ const allConfirmed = computed(
 )
 
 const stillRecognizing = computed(
-  () => !!data.value && data.value.problems.some((p) => p.status === 'pending')
+  () =>
+    !!data.value &&
+    data.value.problems.some((p) => p.status === 'pending' || p.contents.some((c) => c.processing))
 )
 
 // scale is naturalWidth/clientWidth - it depends on how wide the image is
@@ -580,37 +837,6 @@ const rectStyle = (bbox) => {
     width: `${bbox.w * displayScale}px`,
     height: `${bbox.h * displayScale}px`,
   }
-}
-
-// Draggable divider between the image and results panels. The image panel
-// takes this fraction of review-body's width; review-contents fills the
-// rest via flex:1. Resizing it changes image-viewport's size, which the
-// ResizeObserver below already reacts to for the zoom/crop recalculation -
-// no separate wiring needed for the image to keep fitting as you drag.
-const reviewBodyEl = ref(null)
-const imagePanelRatio = ref(0.66)
-const resizingPanels = ref(false)
-const PANEL_RATIO_MIN = 0.25
-const PANEL_RATIO_MAX = 0.8
-
-const onPanelResizeMove = (event) => {
-  const rect = reviewBodyEl.value?.getBoundingClientRect()
-  if (!rect || !rect.width) return
-  const ratio = (event.clientX - rect.left) / rect.width
-  imagePanelRatio.value = Math.min(Math.max(ratio, PANEL_RATIO_MIN), PANEL_RATIO_MAX)
-}
-
-const stopPanelResize = () => {
-  resizingPanels.value = false
-  window.removeEventListener('mousemove', onPanelResizeMove)
-  window.removeEventListener('mouseup', stopPanelResize)
-}
-
-const startPanelResize = (event) => {
-  event.preventDefault()
-  resizingPanels.value = true
-  window.addEventListener('mousemove', onPanelResizeMove)
-  window.addEventListener('mouseup', stopPanelResize)
 }
 
 // Slide view crops/zooms the image to the current problem so its regions
@@ -684,7 +910,23 @@ const startPollingIfNeeded = () => {
   if (stillRecognizing.value) {
     pollTimer = setInterval(async () => {
       const response = await fetch(`/api/pages/${props.pageId}/review`)
-      data.value = await response.json()
+      const fresh = await response.json()
+      // Merged in per-problem via withLocalEdits rather than replacing
+      // data.value outright - this poll now also runs while a reviewer is
+      // actively editing other rows (background region-adjust OCR), not
+      // just during the initial pre-review recognition pass, so a raw
+      // replace would wipe out whatever they're mid-typing elsewhere.
+      if (data.value) {
+        const freshById = new Map(fresh.problems.map((p) => [p.id, p]))
+        for (const problem of data.value.problems) {
+          const freshProblem = freshById.get(problem.id)
+          if (!freshProblem) continue
+          problem.status = freshProblem.status
+          problem.contents = withLocalEdits(problem, freshProblem.contents)
+        }
+      } else {
+        data.value = fresh
+      }
       if (!stillRecognizing.value) stopPolling()
     }, 2000)
   }
@@ -710,7 +952,12 @@ const confirm = async () => {
     const payload = {
       problems: data.value.problems.map((p) => ({
         id: p.id,
-        contents: p.contents.map((c) => ({ id: c.id, content: c.content, label: c.label })),
+        contents: p.contents.map((c) => ({
+          id: c.id,
+          content: c.content,
+          label: c.label,
+          display_mode: c.display_mode,
+        })),
       })),
     }
     const response = await fetch(`/api/pages/${props.pageId}/review`, {
@@ -720,8 +967,33 @@ const confirm = async () => {
     })
     data.value = await response.json()
     justConfirmed.value = true
+    await goToNextUnreviewedPage()
   } finally {
     saving.value = false
+  }
+}
+
+// After confirming, jump straight to another page in the same document
+// that still has something to review - mirrors PageViewer's "next
+// incomplete page" behavior for the selection step. Only pages whose
+// selection is already completed are candidates (an unselected page has no
+// problems yet, so there's nothing to review there). Goes back to the
+// document list when nothing else is left.
+const goToNextUnreviewedPage = async () => {
+  const documentId = data.value?.document_id
+  if (!documentId) return
+  const response = await fetch(`/api/documents/${documentId}`)
+  const document = await response.json()
+  const pages = document.pages || []
+  const isCandidate = (p) => p.id !== props.pageId && p.status === 'completed' && !p.reviewed
+  const currentIndex = pages.findIndex((p) => p.id === props.pageId)
+  const nextPage =
+    (currentIndex >= 0 ? pages.slice(currentIndex + 1).find(isCandidate) : undefined) ||
+    pages.find(isCandidate)
+  if (nextPage) {
+    emit('switch-page', nextPage.id)
+  } else {
+    emit('done')
   }
 }
 
@@ -733,8 +1005,7 @@ onUnmounted(() => {
   stopPolling()
   if (resizeObserver) resizeObserver.disconnect()
   window.removeEventListener('keydown', onKeydown)
-  window.removeEventListener('mousemove', onPanelResizeMove)
-  window.removeEventListener('mouseup', stopPanelResize)
+  stopAutoScroll()
 })
 watch(() => props.pageId, fetchReview)
 </script>
@@ -820,55 +1091,38 @@ watch(() => props.pageId, fetchReview)
 .review-body {
   display: flex;
   align-items: stretch;
+  gap: 0.75rem;
 }
 
-.review-body.resizing {
-  user-select: none;
-}
-
-.review-image {
-  flex: 0 0 auto;
-  min-width: 200px;
+/* Equal thirds - image | contents | preview, all visible at once. */
+.review-panel {
+  flex: 1 1 0;
+  min-width: 0;
   border: 1px solid #e5e7eb;
   border-radius: 0.5rem;
 }
 
-.panel-resize-handle {
-  flex: 0 0 1.25rem;
-  cursor: col-resize;
-  position: relative;
-}
-
-.panel-resize-handle::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 50%;
-  width: 4px;
-  transform: translateX(-50%);
-  border-radius: 999px;
-  background: #e5e7eb;
-}
-
-.panel-resize-handle:hover::after,
-.review-body.resizing .panel-resize-handle::after {
-  background: #93c5fd;
+.review-image {
+  flex-grow: 1.4;
+  display: flex;
+  flex-direction: column;
+  max-height: 68vh;
+  overflow-y: auto;
 }
 
 .image-viewport {
   position: relative;
-  height: 68vh;
+  /* Fills whatever's left under the toggle/adjust-banner, so the whole
+     panel's total height matches review-contents/print-preview-box's own
+     max-height: 68vh instead of adding a flat 68vh on top of them. */
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 
 .image-wrapper {
   position: relative;
   transition: transform 0.25s ease;
-}
-
-.review-body.resizing .image-wrapper {
-  transition: none;
 }
 
 .review-image img {
@@ -957,8 +1211,6 @@ watch(() => props.pageId, fetchReview)
 }
 
 .review-contents {
-  flex: 1;
-  min-width: 0;
   max-height: 68vh;
   overflow-y: auto;
   padding-right: 0.25rem;
@@ -970,6 +1222,48 @@ watch(() => props.pageId, fetchReview)
   border: 1px solid #e5e7eb;
   border-radius: 0.5rem;
   padding: 0.75rem;
+}
+
+.choices-block {
+  flex-shrink: 0;
+  margin-top: 0.6rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  padding: 0.6rem 0.75rem;
+}
+
+.choices-block-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.choices-block-label {
+  flex: 1;
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: #374151;
+}
+
+.choices-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+/* Bleeds out to the card's edges (cancelling the card's own padding) so the
+   sticky background covers the full width when it's pinned above scrolled
+   rows, instead of leaving the card's side padding transparent. */
+.problem-card-sticky {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: white;
+  margin: -0.75rem -0.75rem 0;
+  padding: 0.75rem 0.75rem 0;
+  border-radius: 0.5rem 0.5rem 0 0;
+  border-bottom: 1px solid #e5e7eb;
 }
 
 .problem-card-header {
@@ -1000,6 +1294,20 @@ watch(() => props.pageId, fetchReview)
 .status-tag.confirmed {
   background: #dcfce7;
   color: #166534;
+}
+
+.print-preview-box {
+  flex-grow: 0.7;
+  max-height: 68vh;
+  overflow-y: auto;
+  padding: 0.75rem 1rem;
+}
+
+.print-preview-box-header {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: #374151;
+  margin-bottom: 0.5rem;
 }
 
 .add-content-toolbar {
@@ -1034,8 +1342,14 @@ watch(() => props.pageId, fetchReview)
   align-items: center;
   gap: 0.5rem;
   margin-bottom: 0.6rem;
-  padding-bottom: 0.6rem;
-  border-bottom: 1px dashed #e5e7eb;
+}
+
+.group-label-select {
+  font-size: 0.85rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.4rem;
+  cursor: pointer;
 }
 
 .group-label-input {
@@ -1065,11 +1379,25 @@ watch(() => props.pageId, fetchReview)
   display: flex;
   align-items: flex-start;
   gap: 0.4rem;
+  padding: 0.2rem;
+  border-radius: 0.4rem;
+  cursor: pointer;
+}
+
+.content-row-wrapper:hover {
+  background: #f3f4f6;
+}
+
+.content-row-wrapper.selected {
+  background: #dbeafe;
 }
 
 .select-checkbox {
   margin-top: 0.9rem;
   flex-shrink: 0;
+  width: 1.1rem;
+  height: 1.1rem;
+  cursor: pointer;
 }
 
 .content-group {

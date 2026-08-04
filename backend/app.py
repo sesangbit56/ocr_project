@@ -53,6 +53,7 @@ def document_to_dict(document):
 def page_to_dict(page):
     return {
         "id": str(page.id),
+        "document_id": str(page.document_id),
         "page_number": page.page_number,
         "image_url": f"/api/files/{page.image_path}",
         "width": page.width,
@@ -106,6 +107,22 @@ def upload_document():
     return jsonify(document_to_dict(document)), 201
 
 
+def _pages_with_unconfirmed_problems(page_ids):
+    """Page ids (from the given set) that still have at least one
+    non-confirmed problem - the shared "does this page still need review"
+    signal used by both a single document's page list and the global review
+    queue. A page with no problems yet (still pending selection, or selected
+    with nothing marked on it) is vacuously not in this set."""
+    if not page_ids:
+        return set()
+    return {
+        row[0]
+        for row in db.session.query(Problem.page_id)
+        .filter(Problem.page_id.in_(page_ids), Problem.status != "confirmed")
+        .distinct()
+    }
+
+
 @app.route("/api/documents/<uuid:document_id>", methods=["GET"])
 def get_document(document_id):
     document = Document.query.get_or_404(document_id)
@@ -114,9 +131,90 @@ def get_document(document_id):
         .order_by(Page.page_number)
         .all()
     )
+    unconfirmed_page_ids = _pages_with_unconfirmed_problems([p.id for p in pages])
+
     data = document_to_dict(document)
-    data["pages"] = [page_to_dict(p) for p in pages]
+    data["pages"] = [
+        {**page_to_dict(p), "reviewed": p.id not in unconfirmed_page_ids} for p in pages
+    ]
     return jsonify(data)
+
+
+@app.route("/api/documents/<uuid:document_id>/print", methods=["GET"])
+def get_document_print(document_id):
+    """All of a document's problems, in reading order (page number, then
+    position on the page), each with its full content tree - the data feed
+    for the print/export view. Includes every problem regardless of review
+    status; this is for checking how stored content renders, not a
+    "confirmed only" final export (a filter can be added once the layout
+    itself is validated)."""
+    document = Document.query.get_or_404(document_id)
+    rows = (
+        db.session.query(Problem, Page.page_number)
+        .join(Page, Problem.page_id == Page.id)
+        .filter(Page.document_id == document_id)
+        .order_by(Page.page_number, Problem.order_index)
+        .all()
+    )
+
+    problem_ids = [p.id for p, _ in rows]
+    contents_by_problem = {}
+    if problem_ids:
+        contents = (
+            ProblemContent.query.filter(ProblemContent.problem_id.in_(problem_ids))
+            .order_by(ProblemContent.order_index)
+            .all()
+        )
+        for content in contents:
+            contents_by_problem.setdefault(content.problem_id, []).append(content)
+
+    problems = []
+    for problem, page_number in rows:
+        entry = problem_to_dict(problem, contents_by_problem.get(problem.id, []))
+        entry["page_number"] = page_number
+        problems.append(entry)
+
+    return jsonify({"document": document_to_dict(document), "problems": problems})
+
+
+@app.route("/api/queue/regions", methods=["GET"])
+def get_region_queue():
+    """Every page across all documents that still needs its problem regions
+    marked, oldest document first - the backlog behind the Region Queue
+    page, so a reviewer can work through pending pages without opening each
+    document individually."""
+    rows = (
+        db.session.query(Page, Document)
+        .join(Document, Page.document_id == Document.id)
+        .filter(Page.status != "completed")
+        .order_by(Document.created_at, Page.page_number)
+        .all()
+    )
+    return jsonify([{**page_to_dict(p), "document_filename": d.filename} for p, d in rows])
+
+
+@app.route("/api/queue/reviews", methods=["GET"])
+def get_review_queue():
+    """Every page across all documents whose regions are marked but still
+    has at least one unconfirmed problem - the backlog behind the Review
+    Queue page. Note: recognition only starts once *all* of a document's
+    pages are marked complete (see save_page_problems), so a page can
+    briefly appear here with its problems still unrecognized rather than
+    ready to review - the same thing already happens in PageViewer's
+    per-document sidebar, just surfaced globally here instead."""
+    rows = (
+        db.session.query(Page, Document)
+        .join(Document, Page.document_id == Document.id)
+        .filter(Page.status == "completed")
+        .order_by(Document.created_at, Page.page_number)
+        .all()
+    )
+    unconfirmed_page_ids = _pages_with_unconfirmed_problems([p.id for p, d in rows])
+    return jsonify([
+        {**page_to_dict(p), "document_filename": d.filename}
+        for p, d in rows
+        if p.id in unconfirmed_page_ids
+    ])
 
 
 def delete_problems(problem_ids):
@@ -297,6 +395,8 @@ def problem_content_to_dict(content):
             "h": content.bbox_h,
         },
         "confidence": content.confidence,
+        "processing": bool(content.processing),
+        "display_mode": bool(content.display_mode),
     }
 
 
@@ -357,6 +457,8 @@ def confirm_page_review(page_id):
             if content is not None:
                 content.content = content_data.get("content", content.content)
                 content.label = content_data.get("label", content.label)
+                if "display_mode" in content_data:
+                    content.display_mode = bool(content_data["display_mode"])
 
         problem.status = "confirmed"
 
@@ -382,6 +484,12 @@ NEUTRAL_CHAR_RE = re.compile(r"[\s.,:;!?'\"·…‥]")
 # text layer already extracts the plain value correctly, so there's nothing
 # for pix2text to usefully add, only hallucination risk to invite.
 CHOICE_LABEL_RE = re.compile(r"^([①-⑳])\s*(.*)$")
+
+# A standard multiple-choice set always has exactly these 5 options -- used
+# to pad out a detected choice group that's missing one or more (see
+# recognize_and_save_problem) rather than leaving the reviewer to notice a
+# gap and add it by hand.
+STANDARD_CHOICE_LABELS = ["①", "②", "③", "④", "⑤"]
 
 
 def classify_char_type(ch):
@@ -446,11 +554,17 @@ def merge_segments(chars, problem, scale):
         if seg["bbox"] is None:
             continue
         x0, y0, x1, y1 = seg["bbox"]
+        content = "".join(seg["texts"]).strip()
+        # Formula content is provisional here -- apply_latex_to_formulas
+        # replaces it with the LaTeX OCR result -- so only text segments'
+        # spacing needs cleaning up at this point.
+        if seg["type"] == "text":
+            content = clean_text(content)
         results.append(
             {
                 "type": seg["type"],
                 "label": None,
-                "content": "".join(seg["texts"]).strip(),
+                "content": content,
                 "bbox_x": int(round(x0 * scale)) - problem.x,
                 "bbox_y": int(round(y0 * scale)) - problem.y,
                 "bbox_w": int(round((x1 - x0) * scale)),
@@ -550,11 +664,21 @@ def relabel_choice_row(segments):
             i += 1
             continue
 
-        digit_match = re.match(r"^\D*(\d.*)$", cur["content"].strip())
+        stripped = cur["content"].strip()
+        digit_match = re.match(r"^\D*(\d.*)$", stripped)
         if digit_match:
             # Marker and value already fused in one box (e.g. "@3" ~ "②3");
             # keep only the value, drop the unrecognizable marker prefix.
             result[i] = {**cur, "type": "choice", "label": None, "content": digit_match.group(1)}
+            i += 1
+        elif HANGUL_RE.search(stripped):
+            # This box's own marker glyph may be misread, but its content is
+            # genuine Hangul (e.g. "ㄱ", a <보기>-item reference used as the
+            # answer value itself, not a math expression) -- pix2text
+            # doesn't hallucinate real Hangul out of a misread symbol, so
+            # this is real content. Keep it as the choice's own value
+            # instead of discarding it for whatever's next on the row.
+            result[i] = {**cur, "type": "choice", "label": None, "content": stripped}
             i += 1
         elif _rows_overlap(cur, nxt):
             # Bare marker glyph with nothing else in its box; the value is
@@ -680,7 +804,7 @@ def recognize_scanned_problem_region(problem):
                 text_reader = get_text_ocr_reader()
             crop = img.crop((x0, y0, x1, y1))
             reads = text_reader.readtext(np.array(crop))
-            content = " ".join(t.strip() for _, t, c in reads if t.strip())
+            content = clean_text(" ".join(t.strip() for _, t, c in reads if t.strip()))
             confidence = (sum(c for _, _, c in reads) / len(reads)) if reads else 0.0
             seg_type = "text"
             if not content.strip():
@@ -746,6 +870,29 @@ def clean_latex(latex):
     cleaned = re.sub(r"\{\s*\}", "", cleaned)  # empty groups left behind
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+# Closing-side punctuation/brackets that shouldn't have a space before them,
+# and opening-side ones that shouldn't have a space after -- covers both
+# ASCII and the full-width forms Korean math PDFs commonly use.
+_TEXT_CLOSING_PUNCT = r")\]}.,!?:;、。！？：；’”』」〉》"
+_TEXT_OPENING_BRACKET = r"(\[{‘“『「〈《"
+_TEXT_SPACE_BEFORE_CLOSING_RE = re.compile(r"\s+([" + re.escape(_TEXT_CLOSING_PUNCT) + r"])")
+_TEXT_SPACE_AFTER_OPENING_RE = re.compile(r"([" + re.escape(_TEXT_OPENING_BRACKET) + r"])\s+")
+
+
+def clean_text(text):
+    """Normalizes spacing artifacts from the PDF text layer/OCR in a plain
+    text segment: collapses any run of 2+ spaces to one, and drops a space
+    that lands right before closing punctuation or right after an opening
+    bracket (e.g. "값은 ." or "( x"), both of which read as visibly wrong
+    even when every word itself came through correctly."""
+    if not text:
+        return text
+    cleaned = re.sub(r"\s+", " ", text)
+    cleaned = _TEXT_SPACE_BEFORE_CLOSING_RE.sub(r"\1", cleaned)
+    cleaned = _TEXT_SPACE_AFTER_OPENING_RE.sub(r"\1", cleaned)
+    return cleaned.strip()
 
 
 # pix2text's rendering of a circled-numeral choice marker (①②③④⑤). Some
@@ -958,19 +1105,39 @@ def apply_latex_to_formulas(segments, document, page, problem):
     return result
 
 
+# Mirrors the frontend's isComplexFormula (ProblemPrintout.vue) - only used
+# here to seed a new formula row's initial display_mode. Once saved, that
+# field is the reviewer-editable source of truth; it's never recomputed
+# from this heuristic again for an existing row.
+_COMPLEX_FORMULA_RE = re.compile(r"\\begin\{cases\}|\\sum|\\int|\\lim|\\prod")
+
+
+def _is_complex_formula(latex):
+    if not latex:
+        return False
+    return bool(_COMPLEX_FORMULA_RE.search(latex)) or len(latex) > 24
+
+
 def _content_from_segment(problem_id, segment, parent_content_id, order_index):
+    # Every segment passes through here regardless of which detection path
+    # produced it (PDF text layer, scanned-page OCR, choice-label peeling,
+    # relabel_choice_row's recovery cases, ...) -- the one guaranteed place
+    # to enforce "no leading/trailing whitespace on a stored chunk" without
+    # auditing every upstream function for it individually.
+    content = (segment["content"] or "").strip()
     return ProblemContent(
         problem_id=problem_id,
         parent_content_id=parent_content_id,
         order_index=order_index,
         type=segment["type"],
         label=segment.get("label"),
-        content=segment["content"],
+        content=content,
         bbox_x=segment["bbox_x"],
         bbox_y=segment["bbox_y"],
         bbox_w=segment["bbox_w"],
         bbox_h=segment["bbox_h"],
         confidence=segment["confidence"],
+        display_mode=segment["type"] == "formula" and _is_complex_formula(content),
     )
 
 
@@ -1009,10 +1176,40 @@ def recognize_and_save_problem(document, page, problem):
             contents.append(group)
             top_level_index += 1
 
-            for child_index, seg in enumerate(segments[i:run_end]):
+            child_segments = segments[i:run_end]
+            for child_index, seg in enumerate(child_segments):
                 content = _content_from_segment(problem.id, seg, group.id, child_index)
                 db.session.add(content)
                 contents.append(content)
+
+            # A multiple-choice set always has exactly 5 options -- if OCR
+            # only picked up some of them (label misreads and low-confidence
+            # single-jamo values like ㄱ/ㄴ/ㄷ are common failure modes here),
+            # fill in the rest as empty placeholders so the reviewer starts
+            # from a complete ①-⑤ set instead of having to notice a gap and
+            # add the missing one by hand.
+            detected_labels = {seg.get("label") for seg in child_segments}
+            next_index = len(child_segments)
+            for label in STANDARD_CHOICE_LABELS:
+                if label in detected_labels:
+                    continue
+                placeholder = ProblemContent(
+                    problem_id=problem.id,
+                    parent_content_id=group.id,
+                    order_index=next_index,
+                    type="choice",
+                    label=label,
+                    content="",
+                    bbox_x=0,
+                    bbox_y=0,
+                    bbox_w=min(60, problem.w),
+                    bbox_h=min(30, problem.h),
+                    confidence=None,
+                )
+                db.session.add(placeholder)
+                contents.append(placeholder)
+                next_index += 1
+
             i = run_end
             continue
 
@@ -1105,6 +1302,59 @@ def _containment_ratio(outer, inner):
 IMAGE_OVERLAP_DELETE_THRESHOLD = 0.7
 
 
+def _delete_image_overlaps(problem, content, x, y, w, h):
+    """A new image region's own axis labels/coordinates otherwise tend to
+    get picked up separately as stray text/formula fragments duplicating
+    what the crop already shows -- remove whatever other content rows it
+    substantially covers. Flushes but does not commit."""
+    candidates = ProblemContent.query.filter(
+        ProblemContent.problem_id == problem.id,
+        ProblemContent.id != content.id,
+        ProblemContent.type != "group",
+    ).all()
+    affected_parents = set()
+    for other in candidates:
+        if not other.bbox_w or not other.bbox_h:
+            continue
+        ratio = _containment_ratio(
+            {"x": x, "y": y, "w": w, "h": h},
+            {"x": other.bbox_x, "y": other.bbox_y, "w": other.bbox_w, "h": other.bbox_h},
+        )
+        if ratio >= IMAGE_OVERLAP_DELETE_THRESHOLD:
+            affected_parents.add(other.parent_content_id)
+            db.session.delete(other)
+    db.session.flush()
+    for parent_id in affected_parents:
+        _renumber_siblings(problem.id, parent_id)
+
+
+def run_region_ocr_in_background(content_id, document_id, page_id, crop_x, crop_y, w, h):
+    """Companion to update_content_region's formula/choice path: the model
+    inference itself happens here, off the request thread, so the frontend
+    isn't stuck waiting tens of seconds on it -- see the comment there."""
+    with app.app_context():
+        try:
+            document = Document.query.get(document_id)
+            page = Page.query.get(page_id)
+            model = get_formula_ocr_model()
+            img = crop_region_image(document, page, crop_x, crop_y, w, h)
+            recognized = clean_latex(model.recognize_formula(img).strip())
+            content = ProblemContent.query.get(content_id)
+            if content is not None:
+                content.content = recognized
+                content.confidence = 1.0
+                content.processing = False
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            content = ProblemContent.query.get(content_id)
+            if content is not None:
+                content.processing = False
+                db.session.commit()
+        finally:
+            db.session.remove()
+
+
 @app.route("/api/problem_contents/<uuid:content_id>/region", methods=["POST"])
 def update_content_region(content_id):
     """Manually override a content block's region. For a formula or choice,
@@ -1114,9 +1364,14 @@ def update_content_region(content_id):
     clustering where its bounding box even is). For an image, just saves
     the crop -- a diagram/graph isn't run through any recognition, it's
     shown as-is -- and deletes whatever other content rows the new region
-    substantially covers: a diagram's own axis labels/coordinates otherwise
-    tend to get picked up separately as stray text/formula fragments
-    duplicating what the image crop already shows."""
+    substantially covers.
+
+    The OCR call is a slow model inference (tens of seconds is not unusual),
+    so for formula/choice this responds as soon as the region itself is
+    saved and runs recognition in a background thread -- same pattern as
+    the initial per-page recognition. The frontend polls (via the existing
+    "still recognizing" mechanism, extended to cover this) and picks up the
+    result once processing flips back to false."""
     content = ProblemContent.query.get_or_404(content_id)
     if content.type not in ("formula", "choice", "image"):
         return jsonify({"error": "only formula, choice, or image content can have its region adjusted"}), 400
@@ -1133,44 +1388,34 @@ def update_content_region(content_id):
     if w <= 0 or h <= 0:
         return jsonify({"error": "w and h must be positive"}), 400
 
-    if content.type == "image":
-        content.crop_path = crop_content_image(document, page, content, problem.x + x, problem.y + y, w, h)
-    else:
-        model = get_formula_ocr_model()
-        img = crop_region_image(document, page, problem.x + x, problem.y + y, w, h)
-        content.content = clean_latex(model.recognize_formula(img).strip())
-
     content.bbox_x = x
     content.bbox_y = y
     content.bbox_w = w
     content.bbox_h = h
-    content.confidence = 1.0
-    db.session.flush()
 
     if content.type == "image":
-        candidates = ProblemContent.query.filter(
-            ProblemContent.problem_id == problem.id,
-            ProblemContent.id != content.id,
-            ProblemContent.type != "group",
-        ).all()
-        affected_parents = set()
-        for other in candidates:
-            if not other.bbox_w or not other.bbox_h:
-                continue
-            ratio = _containment_ratio(
-                {"x": x, "y": y, "w": w, "h": h},
-                {"x": other.bbox_x, "y": other.bbox_y, "w": other.bbox_w, "h": other.bbox_h},
-            )
-            if ratio >= IMAGE_OVERLAP_DELETE_THRESHOLD:
-                affected_parents.add(other.parent_content_id)
-                db.session.delete(other)
+        content.crop_path = crop_content_image(document, page, content, problem.x + x, problem.y + y, w, h)
+        content.confidence = 1.0
         db.session.flush()
-        for parent_id in affected_parents:
-            _renumber_siblings(problem.id, parent_id)
+        _delete_image_overlaps(problem, content, x, y, w, h)
+        remaining = ProblemContent.query.filter_by(problem_id=problem.id).order_by(ProblemContent.order_index).all()
+        db.session.commit()
+        return jsonify(problem_to_dict(problem, remaining))
 
+    content.processing = True
     remaining = ProblemContent.query.filter_by(problem_id=problem.id).order_by(ProblemContent.order_index).all()
+    result = problem_to_dict(problem, remaining)
+    # Captured before commit: db.session.commit() expires ORM instance
+    # state by default, so reading these attributes afterward would
+    # trigger implicit reload queries on a session about to be torn down
+    # for this request - grab plain values now instead of relying on that.
+    thread_args = (content.id, document.id, page.id, problem.x + x, problem.y + y, w, h)
+    # Commit before starting the thread, not after -- it opens its own
+    # session (see run_region_ocr_in_background's app_context), which won't
+    # reliably see this row's processing=True until this transaction lands.
     db.session.commit()
-    return jsonify(problem_to_dict(problem, remaining))
+    threading.Thread(target=run_region_ocr_in_background, args=thread_args, daemon=True).start()
+    return jsonify(result)
 
 
 def _is_pinned_last(content):
@@ -1241,21 +1486,34 @@ def group_problem_contents(problem_id):
         return jsonify({"error": "only top-level, non-group content can be grouped"}), 400
 
     ordered_rows = sorted(rows, key=lambda r: r.order_index)
-    top_level_count = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=None).count()
 
-    group = ProblemContent(
-        problem_id=problem_id,
-        parent_content_id=None,
-        order_index=top_level_count,
-        type="group",
-        label=label,
-    )
-    db.session.add(group)
-    db.session.flush()
+    # Reuse a top-level group already carrying this exact label (e.g. a
+    # second "Group selected" into "Choices") instead of creating a sibling
+    # duplicate - two same-labelled groups would both claim to be *the*
+    # choices group to the frontend, which only ever renders the first one
+    # it finds, silently hiding the second's children.
+    group = ProblemContent.query.filter_by(
+        problem_id=problem_id, parent_content_id=None, type="group", label=label
+    ).first()
 
-    for index, row in enumerate(ordered_rows):
+    if group is not None:
+        next_index = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=group.id).count()
+    else:
+        top_level_count = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=None).count()
+        group = ProblemContent(
+            problem_id=problem_id,
+            parent_content_id=None,
+            order_index=top_level_count,
+            type="group",
+            label=label,
+        )
+        db.session.add(group)
+        db.session.flush()
+        next_index = 0
+
+    for offset, row in enumerate(ordered_rows):
         row.parent_content_id = group.id
-        row.order_index = index
+        row.order_index = next_index + offset
     db.session.flush()
     _renumber_siblings(problem_id, None)
 
@@ -1269,12 +1527,86 @@ def ungroup_problem_content(group_id):
     group = ProblemContent.query.get_or_404(group_id)
     if group.type != "group":
         return jsonify({"error": "only group content can be ungrouped"}), 400
+    if group.label == "Choices":
+        return jsonify({"error": "the choices group cannot be ungrouped"}), 400
 
     problem_id = group.problem_id
     _ungroup(group)
     db.session.delete(group)
     db.session.flush()
     _renumber_siblings(problem_id, None)
+
+    remaining = ProblemContent.query.filter_by(problem_id=problem_id).order_by(ProblemContent.order_index).all()
+    db.session.commit()
+    return jsonify(problem_to_dict(Problem.query.get(problem_id), remaining))
+
+
+# "group" is deliberately excluded - it's a structural row managed only via
+# the dedicated group/ungroup endpoints (reparenting children, etc.), not a
+# content kind a reviewer should be able to flip a plain row into here.
+EDITABLE_CONTENT_TYPES = {"text", "formula", "choice", "image"}
+
+
+@app.route("/api/problem_contents/<uuid:content_id>/type", methods=["POST"])
+def set_content_type(content_id):
+    """Changing a row to/from type="choice" also has to move it in or out of
+    the "Choices" group, or the frontend's compact choices block (which
+    renders that group's children as-is, regardless of type) and the plain
+    content tree would disagree about where the row lives - a choice sitting
+    outside the group, or a non-choice stranded inside it."""
+    content = ProblemContent.query.get_or_404(content_id)
+    if content.type == "group":
+        return jsonify({"error": "cannot retype a group row"}), 400
+
+    data = request.get_json() or {}
+    new_type = data.get("type")
+    if new_type not in EDITABLE_CONTENT_TYPES:
+        return jsonify({"error": "invalid type"}), 400
+
+    problem_id = content.problem_id
+    old_parent_id = content.parent_content_id
+    content.type = new_type
+    db.session.flush()
+
+    choices_group = ProblemContent.query.filter_by(
+        problem_id=problem_id, parent_content_id=None, type="group", label="Choices"
+    ).first()
+
+    if new_type == "choice":
+        if choices_group is None:
+            top_level_count = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=None).count()
+            choices_group = ProblemContent(
+                problem_id=problem_id,
+                parent_content_id=None,
+                order_index=top_level_count,
+                type="group",
+                label="Choices",
+            )
+            db.session.add(choices_group)
+            db.session.flush()
+        if content.parent_content_id != choices_group.id:
+            sibling_count = ProblemContent.query.filter_by(
+                problem_id=problem_id, parent_content_id=choices_group.id
+            ).count()
+            content.parent_content_id = choices_group.id
+            content.order_index = sibling_count
+            db.session.flush()
+            _renumber_siblings(problem_id, old_parent_id)
+            _renumber_siblings(problem_id, choices_group.id)
+    elif choices_group is not None and old_parent_id == choices_group.id:
+        top_level_count = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=None).count()
+        content.parent_content_id = None
+        content.order_index = top_level_count
+        db.session.flush()
+        _renumber_siblings(problem_id, choices_group.id)
+        _renumber_siblings(problem_id, None)
+        remaining_children = ProblemContent.query.filter_by(
+            problem_id=problem_id, parent_content_id=choices_group.id
+        ).count()
+        if remaining_children == 0:
+            db.session.delete(choices_group)
+            db.session.flush()
+            _renumber_siblings(problem_id, None)
 
     remaining = ProblemContent.query.filter_by(problem_id=problem_id).order_by(ProblemContent.order_index).all()
     db.session.commit()

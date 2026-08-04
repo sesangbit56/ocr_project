@@ -116,3 +116,15 @@ class ProblemContent(db.Model):
     # path to the cropped diagram/graph image, same pattern as Problem's own
     # crop_path.
     crop_path = db.Column(db.Text)
+    # True while a background LaTeX OCR job for this row's region is in
+    # flight (see update_content_region in app.py) - lets the frontend show
+    # a "recognizing" state and keep polling instead of blocking the
+    # request on a slow model inference call.
+    processing = db.Column(db.Boolean, default=False, nullable=False)
+    # For type="formula" rows: whether the print/preview output renders
+    # this formula in KaTeX display mode (its own full-width line, larger
+    # scripts) rather than inline within the surrounding text. Seeded from
+    # a heuristic at recognition time (see _is_complex_formula in app.py),
+    # then reviewer-editable via a checkbox in the review UI - explicit
+    # from that point on, not re-derived from the heuristic again.
+    display_mode = db.Column(db.Boolean, default=False, nullable=False)
