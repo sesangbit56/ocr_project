@@ -72,6 +72,14 @@
         <input type="checkbox" v-model="content.display_mode" />
         Full line
       </label>
+      <label
+        v-if="showLineBreakToggle"
+        class="display-mode-toggle"
+        title="Start a new line before this block when the group is printed/previewed, instead of flowing inline with what comes before it"
+      >
+        <input type="checkbox" v-model="content.line_break_before" />
+        New line
+      </label>
       <button
         v-if="content.type === 'formula' || content.type === 'image' || content.type === 'choice'"
         class="adjust-button"
@@ -105,6 +113,12 @@ defineProps({
   compact: { type: Boolean, default: false },
   changingType: { type: Boolean, default: false },
   sortable: { type: Boolean, default: true },
+  // Only meaningful for a row that's a child of a group ("보기", a manually
+  // grouped condition list, ...): whether to show the manual "start a new
+  // line before this block" override, for the cases the group's automatic
+  // (가)/(나)/ㄱ/ㄴ/ㄷ line-break detection doesn't catch (see
+  // BOGI_LINE_BREAK_RE in app.py).
+  showLineBreakToggle: { type: Boolean, default: false },
 })
 defineEmits(['delete', 'adjust-region', 'type-change', 'drag-start', 'drag-over', 'drag-leave', 'drop', 'drag-end'])
 </script>

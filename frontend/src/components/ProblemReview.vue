@@ -76,6 +76,22 @@
                 <div class="problem-card-header">
                   <span class="problem-title">Problem {{ currentIndex + 1 }}</span>
                   <span class="status-tag" :class="currentProblem.status">{{ currentProblem.status }}</span>
+                  <div class="problem-header-actions">
+                    <button
+                      class="reset-button"
+                      :disabled="!currentProblem.has_initial_snapshot || revertingContent"
+                      :title="currentProblem.has_initial_snapshot
+                        ? 'Discard all edits and restore this problem\'s original OCR result (no re-recognition)'
+                        : 'No initial OCR snapshot recorded for this problem yet'"
+                      @click="revertToInitialSnapshot(currentProblem)"
+                    >{{ revertingContent ? 'Reverting...' : 'Revert to initial OCR result' }}</button>
+                    <button
+                      class="reset-button"
+                      :disabled="resettingContent"
+                      title="Discard all edits and re-run OCR on this problem's original crop"
+                      @click="resetToInitialRecognition(currentProblem)"
+                    >{{ resettingContent ? 'Re-running...' : 'Re-run OCR' }}</button>
+                  </div>
                 </div>
 
                 <div class="add-content-toolbar">
@@ -143,6 +159,7 @@
                       :submitting-region="submittingRegion"
                       :drag-over="dragOverId === child.id"
                       :changing-type="changingType"
+                      show-line-break-toggle
                       @delete="deleteContent(currentProblem, child)"
                       @adjust-region="startAdjust(currentProblem, child)"
                       @type-change="onTypeChange(currentProblem, child, $event)"
@@ -407,6 +424,7 @@ const withLocalEdits = (problem, serverContents) => {
       content: local.processing ? c.content : local.content,
       label: local.label,
       display_mode: local.display_mode,
+      line_break_before: local.line_break_before,
     }
   })
 }
@@ -552,6 +570,54 @@ const deleteContent = async (problem, content) => {
   problem.contents = withLocalEdits(problem, updated.contents)
 }
 
+// Two distinct escape hatches for "I broke this problem's edits":
+// - revertToInitialSnapshot restores the exact result of the first
+//   successful recognition, replayed from a stored snapshot - no OCR model
+//   call, so it's fast and always reproduces exactly what was there
+//   originally, even if re-running OCR today would (for whatever reason)
+//   come out slightly different.
+// - resetToInitialRecognition actually re-runs OCR on the saved crop. Kept
+//   as a separate, still-useful action (e.g. after adjusting a region) -
+//   distinct from the revert button above, not a replacement for it.
+// Both deliberately skip withLocalEdits: the whole point is to discard
+// local edits, not merge them back in over the fresh/restored result.
+const revertingContent = ref(false)
+const revertToInitialSnapshot = async (problem) => {
+  if (!problem || !problem.has_initial_snapshot || revertingContent.value) return
+  const ok = window.confirm(
+    "Discard all edits to this problem and revert it to its original OCR result?"
+  )
+  if (!ok) return
+  revertingContent.value = true
+  try {
+    const response = await fetch(`/api/problems/${problem.id}/revert`, { method: 'POST' })
+    const updated = await response.json()
+    problem.contents = updated.contents
+    problem.status = updated.status
+  } finally {
+    revertingContent.value = false
+  }
+}
+
+const resettingContent = ref(false)
+const resetToInitialRecognition = async (problem) => {
+  if (!problem || resettingContent.value) return
+  const ok = window.confirm(
+    'Discard all edits to this problem and re-run OCR on its original crop?'
+  )
+  if (!ok) return
+  resettingContent.value = true
+  try {
+    const response = await fetch(`/api/problems/${problem.id}/recognize`, { method: 'POST' })
+    const updated = await response.json()
+    problem.contents = updated.contents
+    problem.status = updated.status
+    problem.has_initial_snapshot = true
+  } finally {
+    resettingContent.value = false
+  }
+}
+
 // Switching a row to/from type="choice" has to move it in or out of the
 // Choices group too (the compact choices block renders that group's
 // children as-is, whatever their type), so unlike content/label edits this
@@ -582,7 +648,7 @@ const onTypeChange = async (problem, content, newType) => {
 // border is a vector line, invisible to it), so a reviewer marks one by
 // selecting the rows that belong inside it.
 const selectedContentIds = ref(new Set())
-const GROUP_LABEL_PRESETS = ['Choices', 'Options']
+const GROUP_LABEL_PRESETS = ['Choices', '보기']
 const groupLabelPreset = ref('Choices')
 const groupLabelCustom = ref('')
 const effectiveGroupLabel = computed(() =>
@@ -658,7 +724,7 @@ const addContent = async (type) => {
       body: JSON.stringify({ type }),
     })
     const updated = await response.json()
-    problem.contents = updated.contents
+    problem.contents = withLocalEdits(problem, updated.contents)
     if (type === 'formula' || type === 'image' || type === 'choice') {
       const created = updated.contents.find((c) => !previousIds.has(c.id))
       if (created) startAdjust(problem, created)
@@ -957,6 +1023,7 @@ const confirm = async () => {
           content: c.content,
           label: c.label,
           display_mode: c.display_mode,
+          line_break_before: c.line_break_before,
         })),
       })),
     }
@@ -1294,6 +1361,27 @@ watch(() => props.pageId, fetchReview)
 .status-tag.confirmed {
   background: #dcfce7;
   color: #166534;
+}
+
+.problem-header-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.4rem;
+}
+
+.reset-button {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid #fca5a5;
+  border-radius: 0.35rem;
+  background: white;
+  color: #b91c1c;
+  cursor: pointer;
+}
+
+.reset-button:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .print-preview-box {

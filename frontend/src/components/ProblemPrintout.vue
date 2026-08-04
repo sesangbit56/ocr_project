@@ -5,13 +5,25 @@
       <!-- &nbsp; (not a plain space) - Vue's template whitespace-condensing
            strips a lone ASCII space text node, but leaves U+00A0 alone. -->
       <span v-if="i > 0 && !skipGapBefore(nonChoicesTopLevel[i - 1], item)">&nbsp;</span>
-      <div v-if="item.type === 'group'" class="content-group">
-        <div class="content-group-label">&lt;{{ item.label }}&gt;</div>
-        <div v-for="child in childrenOf(item.id)" :key="child.id" class="group-row">
+      <div v-if="isBogiGroup(item)" class="bogi-box">
+        <span class="bogi-label">&lt;{{ item.label }}&gt;</span>
+        <template v-for="(child, ci) in childrenOf(item.id)" :key="child.id">
+          <br v-if="ci > 0 && child.line_break_before" />
+          <span v-else-if="ci > 0 && !skipGapBefore(childrenOf(item.id)[ci - 1], child)">&nbsp;</span>
           <span v-if="child.label" class="row-label">{{ child.label }}.</span>
           <img v-if="child.type === 'image'" :src="child.image_url" class="inline-image" />
           <span v-else class="inline-content" v-html="renderContentHtml(child)"></span>
-        </div>
+        </template>
+      </div>
+      <div v-else-if="item.type === 'group'" class="content-group">
+        <div class="content-group-label">&lt;{{ item.label }}&gt;</div>
+        <template v-for="(child, ci) in childrenOf(item.id)" :key="child.id">
+          <br v-if="ci > 0 && child.line_break_before" />
+          <span v-else-if="ci > 0 && !skipGapBefore(childrenOf(item.id)[ci - 1], child)">&nbsp;</span>
+          <span v-if="child.label" class="row-label">{{ child.label }}.</span>
+          <img v-if="child.type === 'image'" :src="child.image_url" class="inline-image" />
+          <span v-else class="inline-content" v-html="renderContentHtml(child)"></span>
+        </template>
       </div>
       <img v-else-if="item.type === 'image'" :src="item.image_url" class="inline-image" />
       <span v-else class="inline-content" v-html="renderContentHtml(item)"></span>
@@ -69,6 +81,12 @@ const childrenOf = (groupId) =>
 // Case-insensitive: some existing rows in the dev data predate the
 // "Choices" (capitalized) label convention used elsewhere in the app.
 const isChoicesGroup = (item) => item.type === 'group' && (item.label || '').toLowerCase() === 'choices'
+
+// A <보기> block (statements the problem body refers to, e.g. "ㄱ. ... ㄴ. ...")
+// gets its own real-exam-style layout - a horizontal rule above and below
+// with the label centered on the top rule - rather than the generic
+// full-border box used for other group labels ("Options", free text, ...).
+const isBogiGroup = (item) => item.type === 'group' && (item.label || '').trim() === '보기'
 
 const choicesGroup = computed(() => topLevelOf.value.find(isChoicesGroup) || null)
 
@@ -233,6 +251,25 @@ const renderContentHtml = (content) => {
   margin-bottom: 0.35em;
 }
 
+.bogi-box {
+  position: relative;
+  border-top: 1.5px solid #111;
+  border-bottom: 1.5px solid #111;
+  padding: 0.9em 0.7em 0.6em;
+  margin: 0.9em 0 0.6em;
+  break-inside: avoid;
+}
+
+.bogi-label {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #fff;
+  padding: 0 0.6em;
+  font-weight: 600;
+}
+
 .group-row {
   margin: 0.2em 0;
 }
@@ -243,8 +280,11 @@ const renderContentHtml = (content) => {
 
 .choices-row {
   display: grid;
-  gap: 0.3em 0.8em;
-  margin-top: 0.45em;
+  /* Row gap widened for breathing room between choices; column gap
+     unchanged. margin-top ~= 2 body-text lines (line-height 1.7em) so the
+     choices read as a visually separate block from the problem statement. */
+  gap: 1em 0.8em;
+  margin-top: 3.4em;
 }
 
 .choice-item {

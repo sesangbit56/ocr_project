@@ -49,6 +49,12 @@ class Problem(db.Model):
     crop_path = db.Column(db.Text)
     status = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # JSON snapshot of this problem's content rows as they came out of the
+    # very first successful recognition pass - set once (see
+    # recognize_and_save_problem in app.py) and never overwritten by later
+    # edits or re-recognition, so there's always a fixed point a reviewer
+    # can restore to without re-running the OCR model.
+    initial_content_snapshot = db.Column(db.Text)
 
     reviews = db.relationship("Review", backref="problem", cascade="all, delete-orphan")
     tags = db.relationship("Tag", secondary="problem_tags", backref="problems")
@@ -128,3 +134,12 @@ class ProblemContent(db.Model):
     # then reviewer-editable via a checkbox in the review UI - explicit
     # from that point on, not re-derived from the heuristic again.
     display_mode = db.Column(db.Boolean, default=False, nullable=False)
+    # Only meaningful for a row nested inside a group ("보기", a manually
+    # grouped condition list, ...): whether the print/preview output starts
+    # a new line before this row instead of flowing it inline with what
+    # came before. Seeded automatically for rows matching a known numbering
+    # pattern - "(가)", "ㄴ", etc. - when grouped under a "보기" label (see
+    # BOGI_LINE_BREAK_RE / group_problem_contents in app.py), then
+    # reviewer-editable from that point on for whatever the heuristic
+    # misses (numbering styles it doesn't recognize, non-보기 groups, ...).
+    line_break_before = db.Column(db.Boolean, default=False, nullable=False)

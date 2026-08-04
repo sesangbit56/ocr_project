@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shutil
@@ -397,6 +398,7 @@ def problem_content_to_dict(content):
         "confidence": content.confidence,
         "processing": bool(content.processing),
         "display_mode": bool(content.display_mode),
+        "line_break_before": bool(content.line_break_before),
     }
 
 
@@ -407,6 +409,10 @@ def problem_to_dict(problem, contents):
         "status": problem.status,
         "bbox": {"x": problem.x, "y": problem.y, "w": problem.w, "h": problem.h},
         "contents": [problem_content_to_dict(c) for c in contents],
+        # Lets the frontend show/disable the "revert to initial OCR" button
+        # without shipping the (potentially large) snapshot JSON itself on
+        # every fetch - only /revert actually needs the full blob.
+        "has_initial_snapshot": bool(problem.initial_content_snapshot),
     }
 
 
@@ -459,6 +465,8 @@ def confirm_page_review(page_id):
                 content.label = content_data.get("label", content.label)
                 if "display_mode" in content_data:
                     content.display_mode = bool(content_data["display_mode"])
+                if "line_break_before" in content_data:
+                    content.line_break_before = bool(content_data["line_break_before"])
 
         problem.status = "confirmed"
 
@@ -858,6 +866,21 @@ def recognize_scanned_problem_region(problem):
 JUNK_LATEX_COMMANDS = [r"\models", r"\bigstar", r"\boxplus", r"\nsubseteq", r"\boldmath", r"\sharp", r"\circ", r"\S", r"\Phi"]
 JUNK_LATEX_COMMANDS_WITH_ARG = [r"\mathfrak"]
 
+# A prime mark ("f'(x)") sometimes comes out of the OCR model as a
+# superscript-of-a-superscript, e.g. h^{\,^{\prime}} instead of h^{\prime} -
+# KaTeX renders the doubly-nested version with the tick floating unusually
+# high and small above the letter, which at print size (~10.5pt) reads as a
+# stray dot rather than a prime. Flattened to a single-level superscript,
+# which renders as a normal prime mark in the usual position.
+NESTED_PRIME_RE = re.compile(r"\^\{[^{}]*\^\{(\\prime+)\}[^{}]*\}")
+
+# \stackrel{.}{X} draws a dot above X - a spurious OCR artifact, not
+# intentional notation (confirmed against real output: neither "≐" over
+# "=" nor a dot over an ordinary variable like an integral bound are
+# actually wanted here), so X is unwrapped down to just itself in every
+# case.
+STRAY_DOT_STACKREL_RE = re.compile(r"\\stackrel\{\.\}\s*\{([^{}]*)\}")
+
 
 def clean_latex(latex):
     if not latex:
@@ -867,6 +890,8 @@ def clean_latex(latex):
         cleaned = re.sub(re.escape(cmd) + r"\{[^{}]*\}", "", cleaned)
     for cmd in JUNK_LATEX_COMMANDS:
         cleaned = re.sub(re.escape(cmd) + r"\b", "", cleaned)
+    cleaned = NESTED_PRIME_RE.sub(r"^{\1}", cleaned)
+    cleaned = STRAY_DOT_STACKREL_RE.sub(r"\1", cleaned)
     cleaned = re.sub(r"\{\s*\}", "", cleaned)  # empty groups left behind
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
@@ -1220,11 +1245,51 @@ def recognize_and_save_problem(document, page, problem):
         i += 1
 
     problem.status = "recognized"
+
+    # Snapshot the very first successful recognition (only) so a reviewer
+    # can later restore to it directly, without re-running OCR - see
+    # revert_problem_to_initial. Needs each row's id resolved (for the
+    # parent/child index mapping below), hence the flush before reading it.
+    if not problem.initial_content_snapshot:
+        db.session.flush()
+        problem.initial_content_snapshot = json.dumps(_snapshot_problem_contents(contents))
+
     return contents
+
+
+def _snapshot_problem_contents(contents):
+    """Serializes content rows for initial_content_snapshot. Parent/child
+    links are encoded as indices into this same list, not DB ids - a
+    restore creates fresh rows with fresh ids, so the original ids
+    wouldn't resolve to anything by then."""
+    index_by_id = {c.id: i for i, c in enumerate(contents)}
+    return [
+        {
+            "order_index": c.order_index,
+            "type": c.type,
+            "label": c.label,
+            "content": c.content,
+            "parent_index": index_by_id.get(c.parent_content_id),
+            "bbox_x": c.bbox_x,
+            "bbox_y": c.bbox_y,
+            "bbox_w": c.bbox_w,
+            "bbox_h": c.bbox_h,
+            "confidence": c.confidence,
+            "crop_path": c.crop_path,
+            "display_mode": bool(c.display_mode),
+        }
+        for c in contents
+    ]
 
 
 @app.route("/api/problems/<uuid:problem_id>/recognize", methods=["POST"])
 def recognize_problem(problem_id):
+    """Re-runs OCR from the problem's saved crop and replaces its content
+    rows outright, discarding any reviewer edits since the original
+    recognition - the "reset to initial OCR" escape hatch. Safe to call more
+    than once: recognition has no randomness (greedy decoding, same crop
+    image in, same content out), so this reproduces the original result
+    rather than a fresh guess."""
     problem = Problem.query.get_or_404(problem_id)
     if not problem.crop_path:
         return jsonify({"error": "problem has no cropped image; re-save problem selection first"}), 400
@@ -1234,7 +1299,54 @@ def recognize_problem(problem_id):
     contents = recognize_and_save_problem(document, page, problem)
     db.session.commit()
 
-    return jsonify([problem_content_to_dict(c) for c in contents])
+    return jsonify({"contents": [problem_content_to_dict(c) for c in contents], "status": problem.status})
+
+
+@app.route("/api/problems/<uuid:problem_id>/revert", methods=["POST"])
+def revert_problem_to_initial(problem_id):
+    """Restores this problem's content rows to the exact result of its
+    first successful recognition (see initial_content_snapshot) - unlike
+    /recognize, this never calls the OCR model, it just replays the
+    snapshot already on record. Fails if no snapshot exists yet (e.g. the
+    problem has never been through recognize_and_save_problem), in which
+    case /recognize is the only option."""
+    problem = Problem.query.get_or_404(problem_id)
+    if not problem.initial_content_snapshot:
+        return jsonify({"error": "no initial OCR snapshot exists for this problem"}), 400
+
+    snapshot = json.loads(problem.initial_content_snapshot)
+
+    ProblemContent.query.filter_by(problem_id=problem.id).delete()
+    db.session.flush()
+
+    new_rows = []
+    for entry in snapshot:
+        row = ProblemContent(
+            problem_id=problem.id,
+            order_index=entry["order_index"],
+            type=entry["type"],
+            label=entry["label"],
+            content=entry["content"],
+            bbox_x=entry["bbox_x"],
+            bbox_y=entry["bbox_y"],
+            bbox_w=entry["bbox_w"],
+            bbox_h=entry["bbox_h"],
+            confidence=entry["confidence"],
+            crop_path=entry["crop_path"],
+            display_mode=entry["display_mode"],
+        )
+        db.session.add(row)
+        new_rows.append(row)
+    db.session.flush()  # need each row's id before wiring up parent_content_id below
+
+    for row, entry in zip(new_rows, snapshot):
+        if entry["parent_index"] is not None:
+            row.parent_content_id = new_rows[entry["parent_index"]].id
+
+    problem.status = "recognized"
+    db.session.commit()
+
+    return jsonify({"contents": [problem_content_to_dict(c) for c in new_rows], "status": problem.status})
 
 
 @app.route("/api/problems/<uuid:problem_id>/contents", methods=["POST"])
@@ -1457,12 +1569,31 @@ def _ungroup(group):
     _renumber_siblings(group.problem_id, None)
 
 
+# Numbering markers that conventionally start a new statement within a
+# <보기> block: "(가)"/"(나)"/... (parenthesized Korean ordinals) and a bare
+# jamo "ㄱ"/"ㄴ"/"ㄷ"/... immediately followed by "." or ")". Checked only
+# when grouping under the literal "보기" label - meaningless as a
+# line-break signal in any other kind of group (e.g. a "(가)/(나)"-style
+# condition list is exactly what these mark, but a free-text "Other" group
+# might legitimately contain unrelated parenthesized text).
+BOGI_LINE_BREAK_RE = re.compile(r"^\((가|나|다|라|마|바|사)\)|^[ㄱㄴㄷㄹㅁㅂㅅ][.\)]")
+
+
+def _looks_like_bogi_marker(content):
+    return bool(content) and bool(BOGI_LINE_BREAK_RE.match(content.strip()))
+
+
 @app.route("/api/problems/<uuid:problem_id>/contents/group", methods=["POST"])
 def group_problem_contents(problem_id):
     """Bundle a set of top-level content rows under a new type="group" row
     (e.g. a <보기> box) with a chosen label. Not auto-detected -- the current
     pipeline reads only the PDF's text layer, which has no signal for a box
-    border, so this is how a reviewer marks one by hand."""
+    border, so this is how a reviewer marks one by hand. Within a "보기"
+    group specifically, rows whose content starts with a recognized
+    numbering marker ("(가)", "ㄴ.", ...) are seeded with
+    line_break_before=True so they print on their own line without the
+    reviewer having to flag each one - anything the pattern misses is still
+    manually toggleable per row from that point on."""
     problem = Problem.query.get_or_404(problem_id)
     data = request.get_json() or {}
 
@@ -1514,6 +1645,8 @@ def group_problem_contents(problem_id):
     for offset, row in enumerate(ordered_rows):
         row.parent_content_id = group.id
         row.order_index = next_index + offset
+        if label == "보기" and _looks_like_bogi_marker(row.content):
+            row.line_break_before = True
     db.session.flush()
     _renumber_siblings(problem_id, None)
 
