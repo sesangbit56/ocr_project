@@ -70,7 +70,7 @@
             </div>
           </div>
 
-          <div class="review-panel review-contents" ref="reviewContentsEl">
+          <div class="review-panel review-contents" ref="reviewContentsEl" @focusin="onContentFocusIn">
             <div v-if="currentProblem" class="problem-card">
               <div class="problem-card-sticky">
                 <div class="problem-card-header">
@@ -255,7 +255,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import katex from 'katex'
 import 'katex/dist/katex.min.css'
 // Registers the <math-field> custom element used below - an experiment to
@@ -704,6 +704,25 @@ const ungroupContent = async (group) => {
   problem.contents = withLocalEdits(problem, updated.contents)
 }
 
+// Tracks which row the reviewer was last working in (by content field
+// focus, not click - clicking a row background toggles its group-selection
+// checkbox, which is a different concern), so a new block lands right
+// where they're currently looking instead of always at the bottom of the
+// list. Anchored to the row's top-level ancestor: a block inside a group
+// (incl. the compact choices grid) can't itself be the insertion point,
+// since new blocks are always created top-level - "after the group" is
+// the closest equivalent.
+const lastFocusedContentId = ref(null)
+const onContentFocusIn = (event) => {
+  if (!event.target.classList?.contains('row-content-field')) return
+  const row = event.target.closest('.content-row')
+  const id = row?.dataset.contentId
+  if (!id) return
+  const content = currentProblem.value?.contents.find((c) => c.id === id)
+  if (!content) return
+  lastFocusedContentId.value = content.parent_content_id || content.id
+}
+
 // Escape hatch for when clustering merges or splits content wrong (e.g.
 // several multiple-choice options recognized as one formula): add an empty
 // row and let the reviewer place it by hand. A new formula row goes
@@ -715,13 +734,21 @@ const addContent = async (type) => {
   const problem = currentProblem.value
   if (!problem || addingContent.value) return
   const previousIds = new Set(problem.contents.map((c) => c.id))
+  // Only valid if it still resolves to a top-level row in this problem -
+  // e.g. not stale from a different problem, and not a row that was since
+  // deleted or absorbed into a group.
+  const afterContentId = problem.contents.some(
+    (c) => c.id === lastFocusedContentId.value && !c.parent_content_id
+  )
+    ? lastFocusedContentId.value
+    : null
 
   addingContent.value = true
   try {
     const response = await fetch(`/api/problems/${problem.id}/contents`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type }),
+      body: JSON.stringify({ type, after_content_id: afterContentId }),
     })
     const updated = await response.json()
     problem.contents = withLocalEdits(problem, updated.contents)
@@ -891,8 +918,26 @@ const updateScale = () => {
   }
 }
 
+// Set right before an auto-advance to the next page (see the pageId watch
+// below) and consumed here - scrolling has to wait for the image to
+// actually finish loading, not just for Vue to patch the DOM, since the
+// image panel's height (and everything's position below the app header)
+// isn't settled until then. Scrolling any earlier reliably undershoots,
+// because the browser computes the target scroll offset from a layout
+// that's about to shift once the image loads in.
+const scrollToTopOnNextImageLoad = ref(false)
+
 const onImageLoad = () => {
   updateScale()
+  if (scrollToTopOnNextImageLoad.value) {
+    scrollToTopOnNextImageLoad.value = false
+    // updateScale's write to scale.value re-renders the image transform,
+    // which still shifts the panel's height after this point - wait for
+    // that re-render to flush before measuring where to scroll to.
+    nextTick(() => {
+      document.querySelector('.review-body')?.scrollIntoView({ block: 'start', behavior: 'auto' })
+    })
+  }
 }
 
 const rectStyle = (bbox) => {
@@ -1074,7 +1119,17 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
   stopAutoScroll()
 })
-watch(() => props.pageId, fetchReview)
+// pageId only ever changes while this component stays mounted via the
+// auto-advance-to-next-page flow in goToNextUnreviewedPage (switch-page is
+// emitted nowhere else) - arm the post-image-load scroll (see
+// scrollToTopOnNextImageLoad/onImageLoad above) so the app header/
+// breadcrumb/page-picker chip row scroll out of view and the reviewer
+// lands straight on the 3-panel review area, instead of having to
+// manually scroll past the same header again for every page.
+watch(() => props.pageId, () => {
+  scrollToTopOnNextImageLoad.value = true
+  fetchReview()
+})
 </script>
 
 <style scoped>
@@ -1159,6 +1214,15 @@ watch(() => props.pageId, fetchReview)
   display: flex;
   align-items: stretch;
   gap: 0.75rem;
+  /* Each .review-panel caps its own height at 68vh and scrolls
+     internally, so without this the page's total height barely exceeds
+     one viewport - nowhere near enough scroll room for the auto-advance
+     scroll (see the pageId watch/onImageLoad below) to actually bring
+     review-body's top up to the viewport's top and scroll the header out
+     of view. Guaranteeing a full viewport of height here (panels stay
+     capped at 68vh via max-height, which always wins over a stretched
+     height) is what makes that scroll distance available at all. */
+  min-height: 100vh;
 }
 
 /* Equal thirds - image | contents | preview, all visible at once. */

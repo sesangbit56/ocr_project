@@ -37,7 +37,7 @@
       <span v-for="child in choiceChildren" :key="child.id" class="choice-item">
         <span class="choice-label">{{ child.label }}</span>
         <img v-if="child.type === 'image'" :src="child.image_url" class="inline-image" />
-        <span v-else v-html="renderContentHtml(child)"></span>
+        <span v-else class="inline-content" v-html="renderContentHtml(child)"></span>
       </span>
     </div>
   </div>

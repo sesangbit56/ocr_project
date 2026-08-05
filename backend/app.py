@@ -42,12 +42,17 @@ with app.app_context():
 
 
 def document_to_dict(document):
+    first_page = Page.query.filter_by(document_id=document.id).order_by(Page.page_number).first()
     return {
         "id": str(document.id),
         "filename": document.filename,
         "total_pages": document.total_pages,
         "status": document.status,
         "created_at": document.created_at.isoformat() if document.created_at else None,
+        # For the document list's gallery view - the document's own cover
+        # page, not tied to review/selection state the way page_to_dict's
+        # image_url is used elsewhere.
+        "thumbnail_url": f"/api/files/{first_page.image_path}" if first_page and first_page.image_path else None,
     }
 
 
@@ -1130,19 +1135,6 @@ def apply_latex_to_formulas(segments, document, page, problem):
     return result
 
 
-# Mirrors the frontend's isComplexFormula (ProblemPrintout.vue) - only used
-# here to seed a new formula row's initial display_mode. Once saved, that
-# field is the reviewer-editable source of truth; it's never recomputed
-# from this heuristic again for an existing row.
-_COMPLEX_FORMULA_RE = re.compile(r"\\begin\{cases\}|\\sum|\\int|\\lim|\\prod")
-
-
-def _is_complex_formula(latex):
-    if not latex:
-        return False
-    return bool(_COMPLEX_FORMULA_RE.search(latex)) or len(latex) > 24
-
-
 def _content_from_segment(problem_id, segment, parent_content_id, order_index):
     # Every segment passes through here regardless of which detection path
     # produced it (PDF text layer, scanned-page OCR, choice-label peeling,
@@ -1162,7 +1154,10 @@ def _content_from_segment(problem_id, segment, parent_content_id, order_index):
         bbox_w=segment["bbox_w"],
         bbox_h=segment["bbox_h"],
         confidence=segment["confidence"],
-        display_mode=segment["type"] == "formula" and _is_complex_formula(content),
+        # Formulas default to inline (unchecked "Full line") regardless of
+        # length/complexity - a reviewer opts a specific formula into its
+        # own full-width line by hand rather than it being pre-selected.
+        display_mode=False,
     )
 
 
@@ -1373,11 +1368,31 @@ def create_problem_content(problem_id):
         if parent is None:
             return jsonify({"error": "parent_content_id must reference a group in this problem"}), 400
 
-    sibling_count = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=parent_content_id).count()
+    # Optional: place the new row right after a specific sibling (the
+    # reviewer's last-focused row) instead of always appending at the end -
+    # a fractional order_index sorts correctly between it and the next
+    # sibling without having to shift everyone else's index by hand;
+    # _renumber_siblings cleans it back up to a plain integer below.
+    raw_after = data.get("after_content_id")
+    order_index = None
+    if raw_after:
+        try:
+            after_uuid = uuid.UUID(str(raw_after))
+        except (ValueError, TypeError, AttributeError):
+            return jsonify({"error": "after_content_id must be a UUID"}), 400
+        after_content = ProblemContent.query.filter_by(
+            id=after_uuid, problem_id=problem_id, parent_content_id=parent_content_id
+        ).first()
+        if after_content is not None:
+            order_index = after_content.order_index + 0.5
+
+    if order_index is None:
+        order_index = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=parent_content_id).count()
+
     content = ProblemContent(
         problem_id=problem_id,
         parent_content_id=parent_content_id,
-        order_index=sibling_count,
+        order_index=order_index,
         type=content_type,
         content="",
         bbox_x=0,

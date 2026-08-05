@@ -129,10 +129,9 @@ class ProblemContent(db.Model):
     processing = db.Column(db.Boolean, default=False, nullable=False)
     # For type="formula" rows: whether the print/preview output renders
     # this formula in KaTeX display mode (its own full-width line, larger
-    # scripts) rather than inline within the surrounding text. Seeded from
-    # a heuristic at recognition time (see _is_complex_formula in app.py),
-    # then reviewer-editable via a checkbox in the review UI - explicit
-    # from that point on, not re-derived from the heuristic again.
+    # scripts) rather than inline within the surrounding text. Defaults to
+    # False (inline) regardless of formula length/complexity; reviewer
+    # opts a specific row into full-line via the checkbox in the review UI.
     display_mode = db.Column(db.Boolean, default=False, nullable=False)
     # Only meaningful for a row nested inside a group ("보기", a manually
     # grouped condition list, ...): whether the print/preview output starts

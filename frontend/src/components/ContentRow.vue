@@ -1,6 +1,7 @@
 <template>
   <div
     class="content-row"
+    :data-content-id="content.id"
     :class="{ 'needs-review': flagged, 'drag-over': dragOver, compact, processing: content.processing }"
     @dragover.prevent="$emit('drag-over')"
     @dragleave="$emit('drag-leave')"
@@ -46,8 +47,9 @@
         v-if="content.type === 'text'"
         v-model="content.content"
         rows="2"
-        class="content-input"
+        class="content-input row-content-field"
         :class="content.type"
+        @keydown="onFieldKeydown"
       ></textarea>
       <div v-else-if="content.type === 'image'" class="image-preview">
         <img v-if="content.image_url" :src="content.image_url" alt="" />
@@ -55,10 +57,11 @@
       </div>
       <math-field
         v-else
-        class="math-field-input"
+        class="math-field-input row-content-field"
         smart-fence
         :value="content.content"
         @input="content.content = $event.target.value"
+        @keydown="onFieldKeydown"
       ></math-field>
     </div>
     <div class="content-row-tools">
@@ -121,6 +124,23 @@ defineProps({
   showLineBreakToggle: { type: Boolean, default: false },
 })
 defineEmits(['delete', 'adjust-region', 'type-change', 'drag-start', 'drag-over', 'drag-leave', 'drop', 'drag-end'])
+
+// Tab jumps straight to the next row's content field (textarea or
+// math-field), skipping the label input, type dropdown, checkboxes, and
+// buttons in between - the default browser tab order would otherwise pass
+// through all of those first, which is slow when moving through many rows.
+// Shift+Tab mirrors it backwards. Falls through to native tab behavior at
+// the start/end of the list (no next/previous field to jump to).
+const onFieldKeydown = (event) => {
+  if (event.key !== 'Tab') return
+  const fields = Array.from(document.querySelectorAll('.row-content-field'))
+  const index = fields.indexOf(event.target)
+  if (index === -1) return
+  const nextField = fields[event.shiftKey ? index - 1 : index + 1]
+  if (!nextField) return
+  event.preventDefault()
+  nextField.focus()
+}
 </script>
 
 <style scoped>
