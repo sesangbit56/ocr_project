@@ -194,10 +194,11 @@
 
 ---
 
-## 8. 수식 기본값, 페이지/문서 갤러리 뷰, 드래그·포커스 기반 UX 개선 (2026-08-05, 커밋 전)
+## 8. 수식 기본값, 페이지/문서 갤러리 뷰, 드래그·포커스 기반 UX 개선 (2026-08-06)
 
-`e2a88fd` 이후 진행한 작업들. 아직 커밋되지 않은 상태 (커밋 시 이 섹션에 실제
-커밋 해시를 추가할 것).
+`3f44765` Default formulas to inline, add page/document gallery views, and improve drag/focus-driven review UX
+
+`e2a88fd` 이후 진행한 작업들.
 
 **수식 "Full line" 체크박스 기본값**
 - 요청: 길이/복잡도와 무관하게 항상 기본 해제(인라인) 상태로.
