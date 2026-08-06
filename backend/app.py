@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import re
 import shutil
 import threading
@@ -429,36 +430,19 @@ def save_page_problems(page_id):
     db.session.commit()
 
     # Recognition (including the LaTeX OCR pass) is slow -- tens of seconds
-    # for a whole document. Respond as soon as the selection itself is saved,
-    # and run recognition in the background so the "Complete" button doesn't
-    # sit there waiting on OCR. The frontend picks up the resulting status
-    # changes by polling the review endpoint.
-    if remaining == 0:
-        threading.Thread(target=run_recognition_in_background, args=(document.id,), daemon=True).start()
+    # per page. Respond as soon as the selection itself is saved, and queue
+    # recognition for THIS page rather than waiting for every page in the
+    # document to be marked complete first - a reviewer working through a
+    # long document gets each page's OCR results as soon as that page is
+    # done, not all at once at the very end. document.status still tracks
+    # whole-document completion (drives the page-gallery view and other
+    # document-level UI), just decoupled from when recognition actually
+    # runs. See _enqueue_ocr_task for why this is a queue rather than a
+    # thread spawned per page.
+    if rectangles:
+        _enqueue_ocr_task(("page", page.id), {"kind": "page", "page_id": page.id})
 
     return jsonify({"page": page_to_dict(page), "document_status": document.status})
-
-
-def run_recognition_in_background(document_id):
-    with app.app_context():
-        try:
-            document = Document.query.get(document_id)
-            if document is None:
-                return
-            rows = (
-                db.session.query(Problem, Page)
-                .join(Page, Problem.page_id == Page.id)
-                .filter(Page.document_id == document.id)
-                .all()
-            )
-            for problem, problem_page in rows:
-                try:
-                    recognize_and_save_problem(document, problem_page, problem)
-                    db.session.commit()
-                except Exception:
-                    db.session.rollback()
-        finally:
-            db.session.remove()
 
 
 def problem_content_to_dict(content):
@@ -814,6 +798,109 @@ def recognize_problem_regions(document, page, problem):
 
     segments = extract_choice_labels(segments)
     return apply_latex_to_formulas(segments, document, page, problem)
+
+
+# All OCR model inference - page-level recognition after a region
+# selection is completed, and per-block re-recognition from "Adjust
+# region" - is funneled through a single sequential worker rather than
+# each request spawning its own thread. The model calls are CPU-bound
+# (pix2text/EasyOCR both run with gpu=False here), so running many at once
+# doesn't parallelize the actual work, it just makes every one of them
+# slower fighting over the same cores. A single worker also puts a hard,
+# well-defined cap on how much is ever "in flight" at once (exactly one
+# task): queuing up an unusually large batch - hundreds of pages completed
+# in quick succession - degrades to "it takes a while, strictly in order"
+# rather than to unbounded concurrent model calls competing for memory/CPU.
+_ocr_task_queue = queue.Queue()
+_ocr_queued_keys = set()
+_ocr_queue_lock = threading.Lock()
+
+
+def _enqueue_ocr_task(key, task):
+    """key is a hashable dedup token, e.g. ("page", page_id) or
+    ("region", content_id). Queuing the same task again while it's still
+    waiting or already in flight is a no-op - re-marking the same page's
+    selection, or re-adjusting the same block's region, before the first
+    pass has even run would otherwise double the work for no benefit."""
+    with _ocr_queue_lock:
+        if key in _ocr_queued_keys:
+            return
+        _ocr_queued_keys.add(key)
+    _ocr_task_queue.put((key, task))
+
+
+def _run_page_recognition_task(page_id):
+    page = Page.query.get(page_id)
+    if page is None:
+        return
+    document = Document.query.get(page.document_id)
+    problems = Problem.query.filter_by(page_id=page_id).all()
+    for problem in problems:
+        try:
+            recognize_and_save_problem(document, page, problem)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+
+def _ocr_worker_loop():
+    while True:
+        key, task = _ocr_task_queue.get()
+        try:
+            with app.app_context():
+                try:
+                    if task["kind"] == "page":
+                        _run_page_recognition_task(task["page_id"])
+                    elif task["kind"] == "region":
+                        _run_region_recognition_task(
+                            task["content_id"],
+                            task["document_id"],
+                            task["page_id"],
+                            task["x"],
+                            task["y"],
+                            task["w"],
+                            task["h"],
+                        )
+                finally:
+                    db.session.remove()
+        except Exception:
+            # Each task function already handles/commits its own failures -
+            # this is a last-resort guard so a truly unexpected error (e.g.
+            # the DB connection itself dropping) can't kill the worker
+            # thread and silently stop everything queued behind it.
+            pass
+        finally:
+            with _ocr_queue_lock:
+                _ocr_queued_keys.discard(key)
+            _ocr_task_queue.task_done()
+
+
+def _start_ocr_worker():
+    threading.Thread(target=_ocr_worker_loop, daemon=True).start()
+
+
+def _recover_ocr_queue_on_startup():
+    """Runs once at process start, before the worker starts pulling tasks.
+    Page-level recognition is resumable because Problem.status stays
+    "pending" in the DB until OCR actually succeeds - so any pages left
+    mid-batch by a previous run (a crash, or the dev server's own
+    auto-reload) get automatically picked back up here instead of silently
+    stalling until something else happens to re-trigger them. Per-block
+    region re-recognition has no equivalent recovery: the crop coordinates
+    for an in-flight "Adjust region" call only ever existed as in-memory
+    task args, never persisted, so a stray processing=True left over from
+    an interrupted run is just cleared here (the reviewer re-triggers that
+    one block by hand) rather than guessed at."""
+    with app.app_context():
+        stray_page_ids = {
+            row[0]
+            for row in db.session.query(Problem.page_id).filter(Problem.status == "pending").distinct()
+        }
+        for page_id in stray_page_ids:
+            _enqueue_ocr_task(("page", page_id), {"kind": "page", "page_id": page_id})
+
+        ProblemContent.query.filter_by(processing=True).update({"processing": False})
+        db.session.commit()
 
 
 _formula_ocr_model = None
@@ -1534,31 +1621,30 @@ def _delete_image_overlaps(problem, content, x, y, w, h):
         _renumber_siblings(problem.id, parent_id)
 
 
-def run_region_ocr_in_background(content_id, document_id, page_id, crop_x, crop_y, w, h):
+def _run_region_recognition_task(content_id, document_id, page_id, crop_x, crop_y, w, h):
     """Companion to update_content_region's formula/choice path: the model
     inference itself happens here, off the request thread, so the frontend
-    isn't stuck waiting tens of seconds on it -- see the comment there."""
-    with app.app_context():
-        try:
-            document = Document.query.get(document_id)
-            page = Page.query.get(page_id)
-            model = get_formula_ocr_model()
-            img = crop_region_image(document, page, crop_x, crop_y, w, h)
-            recognized = clean_latex(model.recognize_formula(img).strip())
-            content = ProblemContent.query.get(content_id)
-            if content is not None:
-                content.content = recognized
-                content.confidence = 1.0
-                content.processing = False
+    isn't stuck waiting tens of seconds on it -- see the comment there. Runs
+    on the shared OCR worker (see _enqueue_ocr_task), which already
+    provides the app context / session teardown this needs."""
+    try:
+        document = Document.query.get(document_id)
+        page = Page.query.get(page_id)
+        model = get_formula_ocr_model()
+        img = crop_region_image(document, page, crop_x, crop_y, w, h)
+        recognized = clean_latex(model.recognize_formula(img).strip())
+        content = ProblemContent.query.get(content_id)
+        if content is not None:
+            content.content = recognized
+            content.confidence = 1.0
+            content.processing = False
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        content = ProblemContent.query.get(content_id)
+        if content is not None:
+            content.processing = False
             db.session.commit()
-        except Exception:
-            db.session.rollback()
-            content = ProblemContent.query.get(content_id)
-            if content is not None:
-                content.processing = False
-                db.session.commit()
-        finally:
-            db.session.remove()
 
 
 @app.route("/api/problem_contents/<uuid:content_id>/region", methods=["POST"])
@@ -1615,12 +1701,21 @@ def update_content_region(content_id):
     # state by default, so reading these attributes afterward would
     # trigger implicit reload queries on a session about to be torn down
     # for this request - grab plain values now instead of relying on that.
-    thread_args = (content.id, document.id, page.id, problem.x + x, problem.y + y, w, h)
-    # Commit before starting the thread, not after -- it opens its own
-    # session (see run_region_ocr_in_background's app_context), which won't
-    # reliably see this row's processing=True until this transaction lands.
+    task = {
+        "kind": "region",
+        "content_id": content.id,
+        "document_id": document.id,
+        "page_id": page.id,
+        "x": problem.x + x,
+        "y": problem.y + y,
+        "w": w,
+        "h": h,
+    }
+    # Commit before queuing, not after -- the worker opens its own session
+    # (see _ocr_worker_loop), which won't reliably see this row's
+    # processing=True until this transaction lands.
     db.session.commit()
-    threading.Thread(target=run_region_ocr_in_background, args=thread_args, daemon=True).start()
+    _enqueue_ocr_task(("region", content.id), task)
     return jsonify(result)
 
 
@@ -1900,4 +1995,13 @@ def reorder_problem_contents(problem_id):
 
 
 if __name__ == "__main__":
+    # debug=True runs the app under Werkzeug's auto-reloader, which
+    # actually launches this script twice - an outer watcher process, then
+    # an inner one (marked by WERKZEUG_RUN_MAIN) that actually serves
+    # requests. Starting the OCR worker/recovery scan in the watcher too
+    # would mean two workers pulling from the same queue and two redundant
+    # startup scans - only the real serving process should do this.
+    if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        _recover_ocr_queue_on_startup()
+        _start_ocr_worker()
     app.run(debug=True, threaded=True)
