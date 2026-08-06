@@ -294,7 +294,7 @@
 
 ## 9. uploads 폴더 직접 추가 자동 처리, 한글 파일명 보존, 문서 이름 수정 (2026-08-07)
 
-`e2a88fd` 이후 진행한 작업들 중 9번째 묶음. 커밋 시 이 줄에 실제 해시 반영할 것.
+`32d42fb` Support scanned PDFs dropped directly into uploads/, preserve Korean filenames, and add document rename
 
 **한글 파일명이 깨지고 있던 원인 발견**
 - 업로드 시 표시용 파일명에 `secure_filename()`을 적용하고 있었는데, 이
