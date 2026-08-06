@@ -11,7 +11,6 @@ import numpy as np
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from PIL import Image
-from werkzeug.utils import secure_filename
 
 from models import Document, Job, Page, Problem, ProblemContent, ProblemTag, Review, db
 
@@ -70,18 +69,47 @@ def page_to_dict(page):
 
 @app.route("/api/documents", methods=["GET"])
 def list_documents():
+    _scan_uploads_folder()
     documents = Document.query.order_by(Document.created_at.desc()).all()
     return jsonify([document_to_dict(d) for d in documents])
 
 
-@app.route("/api/documents", methods=["POST"])
-def upload_document():
-    file = request.files.get("file")
-    if not file or not file.filename:
-        return jsonify({"error": "file is required"}), 400
+def _random_document_name(extension=".pdf"):
+    return f"document_{uuid.uuid4().hex[:8]}{extension}"
 
-    filename = secure_filename(file.filename)
-    document = Document(filename=filename, file_path="", status="uploaded")
+
+def _safe_display_filename(raw_filename):
+    """The display filename (Document.filename) is purely a label - the
+    actual bytes on disk always live at a UUID-generated path
+    (<document-id>/original.pdf), never at a path built from the user's
+    filename, so there's no path-traversal/filesystem-safety reason to run
+    it through secure_filename() the way the upload endpoint used to.
+    That mattered because secure_filename strips non-ASCII characters
+    entirely - it turns "수학문제.pdf" into just "pdf" - so doing that
+    destroyed Korean titles outright rather than protecting anything.
+    Korean (and other non-ASCII) text is preserved as-is here. The one
+    fallback case is a name that's already corrupted before it reaches us
+    (U+FFFD replacement characters, from a prior lossy decode somewhere
+    upstream - e.g. a browser or filesystem using a different encoding than
+    expected) - there's nothing meaningful left to preserve there, so a
+    random name is used instead of persisting visible corruption. This
+    can't catch subtler mojibake (valid-looking but wrong characters from a
+    wrong-codec decode), only the unambiguous U+FFFD case."""
+    name = os.path.basename(raw_filename or "").strip()
+    if not name or "�" in name:
+        return _random_document_name(os.path.splitext(name)[1] or ".pdf")
+    return name
+
+
+def _create_document_from_pdf(display_filename, save_pdf_fn):
+    """Shared by web upload and uploads-folder scanning: creates the
+    Document row + its own UUID storage folder, lets save_pdf_fn place the
+    actual PDF bytes at the resulting path, then renders every page to a
+    PNG and creates the matching Page rows. save_pdf_fn is a callback
+    (rather than this function copying bytes itself) so each caller
+    controls exactly how the bytes get there - a FileStorage.save() for a
+    web upload, a shutil.move() for a file already sitting on disk."""
+    document = Document(filename=display_filename, file_path="", status="uploaded")
     db.session.add(document)
     db.session.flush()
 
@@ -89,7 +117,7 @@ def upload_document():
     os.makedirs(doc_dir, exist_ok=True)
 
     pdf_path = os.path.join(doc_dir, "original.pdf")
-    file.save(pdf_path)
+    save_pdf_fn(pdf_path)
     document.file_path = f"{document.id}/original.pdf"
 
     pdf = fitz.open(pdf_path)
@@ -110,6 +138,39 @@ def upload_document():
     pdf.close()
 
     db.session.commit()
+    return document
+
+
+def _scan_uploads_folder():
+    """Picks up PDF files placed directly into the uploads folder rather
+    than through the web upload form (e.g. copied in via a file manager).
+    Existing documents each live inside their own <uuid>/ subfolder, so any
+    .pdf sitting loose at the uploads folder's top level is necessarily a
+    new, not-yet-ingested file - run through the same ingestion as a web
+    upload (and moved into its own subfolder in the process). Cheap to call
+    on every document-list fetch: a directory listing plus, ordinarily,
+    zero matching loose files."""
+    ingested = []
+    if not os.path.isdir(upload_dir):
+        return ingested
+    for name in os.listdir(upload_dir):
+        full_path = os.path.join(upload_dir, name)
+        if not os.path.isfile(full_path) or not name.lower().endswith(".pdf"):
+            continue
+        display_filename = _safe_display_filename(name)
+        document = _create_document_from_pdf(display_filename, lambda pdf_path, _src=full_path: shutil.move(_src, pdf_path))
+        ingested.append(document)
+    return ingested
+
+
+@app.route("/api/documents", methods=["POST"])
+def upload_document():
+    file = request.files.get("file")
+    if not file or not file.filename:
+        return jsonify({"error": "file is required"}), 400
+
+    display_filename = _safe_display_filename(file.filename)
+    document = _create_document_from_pdf(display_filename, file.save)
     return jsonify(document_to_dict(document)), 201
 
 
@@ -253,6 +314,24 @@ def delete_document(document_id):
     shutil.rmtree(os.path.join(upload_dir, str(document_id)), ignore_errors=True)
 
     return jsonify({"ok": True})
+
+
+@app.route("/api/documents/<uuid:document_id>", methods=["PATCH"])
+def rename_document(document_id):
+    """Renames a document's display label only - the underlying file
+    always lives at its own UUID path (see _create_document_from_pdf), so
+    this is a pure DB update with no filesystem changes. The main use case
+    is fixing an unhelpful name after an uploads-folder scan had to fall
+    back to a random one (see _safe_display_filename), or just relabeling
+    for easier browsing."""
+    document = Document.query.get_or_404(document_id)
+    data = request.get_json() or {}
+    new_filename = (data.get("filename") or "").strip()
+    if not new_filename:
+        return jsonify({"error": "filename must not be empty"}), 400
+    document.filename = new_filename
+    db.session.commit()
+    return jsonify(document_to_dict(document))
 
 
 @app.route("/api/files/<path:filename>")

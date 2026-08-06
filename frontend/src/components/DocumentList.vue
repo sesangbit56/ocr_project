@@ -22,12 +22,28 @@
         v-for="doc in documents"
         :key="doc.id"
         class="document-item"
-        @click="$emit('select', doc.id)"
+        @click="renamingId ? null : $emit('select', doc.id)"
       >
-        <span class="filename">{{ doc.filename }}</span>
+        <input
+          v-if="renamingId === doc.id"
+          v-model="renameValue"
+          class="rename-input"
+          :ref="(el) => el && el.focus()"
+          @click.stop
+          @keydown.enter="saveRename(doc)"
+          @keydown.esc="cancelRename"
+        />
+        <span v-else class="filename">{{ doc.filename }}</span>
         <span class="pages">{{ doc.total_pages }} pages</span>
         <span class="status" :class="doc.status">{{ statusLabel(doc.status) }}</span>
-        <button class="delete-button" @click.stop="confirmDelete(doc)">Delete</button>
+        <template v-if="renamingId === doc.id">
+          <button class="rename-button" @click.stop="saveRename(doc)">Save</button>
+          <button class="rename-cancel-button" @click.stop="cancelRename">Cancel</button>
+        </template>
+        <template v-else>
+          <button class="rename-button" @click.stop="startRename(doc)">Rename</button>
+          <button class="delete-button" @click.stop="confirmDelete(doc)">Delete</button>
+        </template>
       </li>
     </ul>
 
@@ -36,16 +52,32 @@
         v-for="doc in documents"
         :key="doc.id"
         class="document-card"
-        @click="$emit('select', doc.id)"
+        @click="renamingId ? null : $emit('select', doc.id)"
       >
         <img v-if="doc.thumbnail_url" :src="doc.thumbnail_url" class="document-thumb" alt="" />
         <div v-else class="document-thumb document-thumb-placeholder">No preview</div>
         <div class="document-card-info">
-          <span class="filename">{{ doc.filename }}</span>
+          <input
+            v-if="renamingId === doc.id"
+            v-model="renameValue"
+            class="rename-input"
+            :ref="(el) => el && el.focus()"
+            @click.stop
+            @keydown.enter="saveRename(doc)"
+            @keydown.esc="cancelRename"
+          />
+          <span v-else class="filename">{{ doc.filename }}</span>
           <span class="pages">{{ doc.total_pages }} pages</span>
           <span class="status" :class="doc.status">{{ statusLabel(doc.status) }}</span>
         </div>
-        <button class="delete-button" @click.stop="confirmDelete(doc)">Delete</button>
+        <template v-if="renamingId === doc.id">
+          <button class="rename-button" @click.stop="saveRename(doc)">Save</button>
+          <button class="rename-cancel-button" @click.stop="cancelRename">Cancel</button>
+        </template>
+        <template v-else>
+          <button class="rename-button" @click.stop="startRename(doc)">Rename</button>
+          <button class="delete-button" @click.stop="confirmDelete(doc)">Delete</button>
+        </template>
       </div>
     </div>
   </div>
@@ -61,7 +93,7 @@ defineProps({
   },
 })
 
-const emit = defineEmits(['select', 'delete'])
+const emit = defineEmits(['select', 'delete', 'rename'])
 
 const viewMode = ref('list')
 
@@ -69,6 +101,29 @@ const confirmDelete = (doc) => {
   if (confirm(`Delete "${doc.filename}"? This cannot be undone.`)) {
     emit('delete', doc.id)
   }
+}
+
+// Inline rename: click "Rename" to swap the filename for a text input,
+// Enter/Save commits, Escape/Cancel discards. Row-click-to-open is
+// suppressed globally while any row is mid-rename, so clicking elsewhere
+// to dismiss doesn't also navigate into the document being renamed.
+const renamingId = ref(null)
+const renameValue = ref('')
+
+const startRename = (doc) => {
+  renamingId.value = doc.id
+  renameValue.value = doc.filename
+}
+
+const cancelRename = () => {
+  renamingId.value = null
+}
+
+const saveRename = (doc) => {
+  const trimmed = renameValue.value.trim()
+  renamingId.value = null
+  if (!trimmed || trimmed === doc.filename) return
+  emit('rename', doc.id, trimmed)
 }
 
 const statusLabel = (status) => {
@@ -163,6 +218,32 @@ const statusLabel = (status) => {
   cursor: pointer;
 }
 
+.rename-button {
+  border: 1px solid #d1d5db;
+  border-radius: 0.5rem;
+  padding: 0.45rem 0.8rem;
+  background: white;
+  color: #374151;
+  cursor: pointer;
+}
+
+.rename-cancel-button {
+  border: 1px solid #d1d5db;
+  border-radius: 0.5rem;
+  padding: 0.45rem 0.8rem;
+  background: white;
+  color: #6b7280;
+  cursor: pointer;
+}
+
+.rename-input {
+  flex: 1;
+  font: inherit;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid #2563eb;
+  border-radius: 0.35rem;
+}
+
 .empty {
   color: #6b7280;
   padding: 1rem 0;
@@ -218,8 +299,14 @@ const statusLabel = (status) => {
   white-space: nowrap;
 }
 
-.document-card .delete-button {
+.document-card .delete-button,
+.document-card .rename-button,
+.document-card .rename-cancel-button {
   font-size: 0.8rem;
   padding: 0.3rem 0.6rem;
+}
+
+.document-card .rename-input {
+  font-size: 0.85rem;
 }
 </style>

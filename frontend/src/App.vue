@@ -16,7 +16,7 @@
 
     <template v-if="view === 'list'">
       <DocumentUpload @uploaded="onUploaded" />
-      <DocumentList :documents="documents" @select="openDocument" @delete="deleteDocument" />
+      <DocumentList :documents="documents" @select="openDocument" @delete="deleteDocument" @rename="renameDocument" />
     </template>
 
     <PageViewer
@@ -104,6 +104,15 @@ const deleteDocument = async (id) => {
     fetchDocuments()
     fetchQueueCounts()
   }
+}
+
+const renameDocument = async (id, filename) => {
+  const response = await fetch(`/api/documents/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename }),
+  })
+  if (response.ok) fetchDocuments()
 }
 
 const goToList = () => {
