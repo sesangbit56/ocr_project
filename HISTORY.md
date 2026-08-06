@@ -352,7 +352,7 @@
 
 ## 10. 페이지 단위 즉시 OCR + 순차 큐 설계, 동시 처리 실험 (2026-08-07)
 
-`415e8d0` 이후 진행한 작업들 중 10번째 묶음. 커밋 시 이 줄에 실제 해시 반영할 것.
+`2b999ee` Trigger OCR per-page immediately, and replace unbounded background threads with a sequential recovery-capable queue
 
 **문서 전체 완료를 기다리지 않고 페이지별로 즉시 OCR**
 - 요청 배경: 지금 프로그램은 페이지 하나를 작업 단위로 굴러가는데, 최초
