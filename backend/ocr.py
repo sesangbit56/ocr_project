@@ -8,7 +8,9 @@
 import json
 import os
 import re
+import shutil
 import threading
+from pathlib import Path
 
 import fitz
 import numpy as np
@@ -178,6 +180,43 @@ def relabel_choice_row(segments):
     return result
 
 
+def _get_quantized_mfr_dir():
+    # MFR(수식->LaTeX) 모델의 INT8 양자화 사본을 준비해서 그 디렉터리
+    # 경로를 반환한다. 이 파이프라인에서 가장 오래 걸리는 단계가 MFR인데
+    # (박스 하나당 CPU에서 수 초), 실측해보니 같은 가중치를 정밀도만
+    # 낮춘 것이라 출력은 사실상 그대로면서(실제 조판된 수식 10개로
+    # 테스트 - 9개 완전 일치, 나머지 1개도 렌더링 결과가 같은 불필요한
+    # 중괄호 차이뿐) CPU 추론 속도는 1.3~1.7배 빨라진다. 이미 다른
+    # 프로세스가 만들어둔 캐시가 있으면 그걸 재사용하고, 없으면
+    # pix2text가 원본 FP32 모델을 받아두는 자리(못 받아뒀으면 그
+    # 다운로드까지) 그대로 이용해서 딱 한 번만 양자화한다.
+    from onnxruntime.quantization import QuantType, quantize_dynamic
+    from pix2text.consts import MODEL_VERSION
+    from pix2text.latex_ocr import AVAILABLE_MODELS
+    from pix2text.utils import data_dir, prepare_model_files2
+
+    model_root = Path(data_dir()) / MODEL_VERSION
+    src_dir = model_root / "mfr-1.5-onnx"
+    int8_dir = model_root / "mfr-1.5-onnx-int8"
+    onnx_names = ["encoder_model.onnx", "decoder_model.onnx"]
+
+    if int8_dir.is_dir() and all((int8_dir / name).is_file() for name in onnx_names):
+        return str(int8_dir)
+
+    if not (src_dir.is_dir() and list(src_dir.glob("**/[!.]*"))):
+        model_info = AVAILABLE_MODELS.get_info("mfr-1.5", "onnx")
+        prepare_model_files2(model_fp_or_dir=src_dir, remote_repo=model_info["hf_model_id"], file_or_dir="dir")
+
+    int8_dir.mkdir(parents=True, exist_ok=True)
+    for item in src_dir.iterdir():
+        if item.is_file() and item.name not in onnx_names:
+            shutil.copy(item, int8_dir / item.name)
+    for name in onnx_names:
+        quantize_dynamic(model_input=str(src_dir / name), model_output=str(int8_dir / name), weight_type=QuantType.QInt8)
+
+    return str(int8_dir)
+
+
 _formula_ocr_model = None
 _formula_ocr_model_lock = threading.Lock()
 
@@ -190,6 +229,8 @@ def get_formula_ocr_model():
     # recognize_formula뿐 아니라 페이지 레이아웃 전체를 분석하는
     # recognize_page도 이 같은 객체에서 호출한다(analyze_problem_layout
     # 참고) - 모델을 새로 로드할 필요가 없으므로 그대로 재사용한다.
+    # MFR(수식 인식) 서브모델만 INT8 양자화 사본으로 바꿔서 로드한다 -
+    # 레이아웃/수식 위치 검출/표 구조는 원래 모델 그대로다.
     #
     # 잠금이 필요한 이유: 서버가 막 켜진 직후에는 백그라운드 OCR
     # 워커(밀린 작업을 이어서 처리)와 방금 들어온 요청이 동시에 이
@@ -203,7 +244,10 @@ def get_formula_ocr_model():
             if _formula_ocr_model is None:
                 from pix2text import Pix2Text
 
-                _formula_ocr_model = Pix2Text.from_config()
+                mfr_dir = _get_quantized_mfr_dir()
+                _formula_ocr_model = Pix2Text.from_config(
+                    total_configs={"text_formula": {"formula": {"model_dir": mfr_dir}}}
+                )
     return _formula_ocr_model
 
 

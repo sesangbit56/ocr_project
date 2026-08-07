@@ -611,6 +611,66 @@
 
 ---
 
+## 13. MFR(수식 인식) 속도 개선 - DirectML/NPU/KV캐시 검토 후 INT8 양자화로 결론 (2026-08-07)
+
+**출발점**: OCR 파이프라인에서 어느 단계가 제일 오래 걸리는지 물어봐서 단계별로 실측 -
+레이아웃 분석(DocLayout-YOLO) ~1.7초, MFD(수식 위치 검출) 0.15~1.6초인데 반해,
+**MFR(수식→LaTeX, pix2text-mfr-1.5)만 박스 하나당 4~7초(첫 호출은 최대 25초)**로
+압도적으로 느림. 원인을 config까지 열어서 확인 - TrOCR 구조(DeiT 인코더 + BART류
+디코더)를 ONNX로 export하면서 `use_cache: false`로 배포됨 - 캐시 없이 토큰 하나 낼
+때마다 지금까지 나온 시퀀스 전체를 처음부터 다시 계산(사실상 O(N²)).
+
+**시도 1: DirectML (Intel Arc 130V GPU)**
+- `onnxruntime` → `onnxruntime-directml`로 교체, pix2text의 `more_model_configs={'provider':
+  'DmlExecutionProvider'}`로 MFR만 GPU에 태워봄 - MFR 단독은 CPU 대비 ~2.1배,
+  MFD는 그대로 CPU에 남아(ultralytics가 DirectML을 인식 못 함) 실제 운영 경로
+  (MFD+MFR) 기준으로는 ~1.4배.
+- 치명적 부작용 발견: `onnxruntime-directml` 설치 후 MFD(ultralytics)가 자기
+  의존성 검사에서 "onnxruntime을 못 찾았다"고 판단해 **백그라운드에서 몰래 일반
+  onnxruntime을 재설치**하려 시도 - 실제로 걸려서 설치 상태가 뒤섞이는 걸 확인.
+  `ULTRALYTICS_SKIP_REQUIREMENTS_CHECKS=1`로 막을 수 있는 걸 찾았지만, 얻는
+  이득 대비 이 취약성이 부담스러워서 보류하기로 결정하고 `onnxruntime`을 원래
+  버전(1.28.0, CPU)으로 되돌림 - `ocr.py`에는 반영 안 함.
+
+**시도 2: Intel NPU** — 하드웨어는 있음(Core Ultra 5 226V, "Intel(R) AI Boost" 확인).
+다만 NPU는 고정 입력 크기에 강한데, 느린 건 정확히 그 반대인 가변 길이
+autoregressive 디코더라 적합하지 않다고 판단, 실측 없이 기각.
+
+**시도 3: KV 캐시 활성화** — `decoder_model.onnx`를 직접 열어 확인해보니 애초에
+`past_key_values` 입출력이 없는(캐시 미지원) 그래프로 export되어 있어서 설정만
+바꿔서는 안 됨. pix2text가 pytorch 백엔드로 쓰는 체크포인트
+(`breezedeus/pix2text-mfr-1.5-pytorch`)를 로드해서 캐시가 되는 순정 HF
+`generate()`를 쓰려 했으나 **HF 저장소가 401(비공개/인증 필요)**로 막혀 있음 -
+공개된 ONNX 모델 카드의 공식 예제 코드 자체가 `use_cache=False`를 쓰고 있어서,
+제작자가 캐시 지원 버전을 따로 공개하지 않은 것으로 보임. 남은 방법(ONNX 안에
+박힌 가중치를 텐서 이름 대조로 PyTorch에 역매핑해서 재-export)은 잘못 매핑하면
+"그럴듯하지만 미묘하게 틀린 LaTeX"을 조용히 낼 위험이 있어 보류.
+
+**시도 4: INT8 동적 양자화 → 채택**
+- `onnxruntime.quantization.quantize_dynamic`으로 기존 `encoder_model.onnx`/
+  `decoder_model.onnx`를 그대로 양자화(가중치 재추출/재매핑 없음, 같은 가중치
+  정밀도만 낮춤 - decoder 32MB→8.5MB, encoder 87.5MB→23MB).
+- 정확도 검증: matplotlib mathtext로 실제 조판에 가까운 수식 이미지 10개(분수,
+  지수, 적분, 시그마, 삼각함수 조합, 극한, 중첩 분수/근호 등)를 만들어 FP32와
+  INT8 출력을 대조 - **10개 중 9개 완전 일치**, 나머지 1개도 `\frac{...}`를
+  감싸는 불필요한 중괄호 하나 차이뿐이라 렌더링 결과는 동일. 실질적 정확도
+  손실 없음으로 판단.
+- 속도: 간단한 수식 4개 평균 **1.73배**, 복잡한 수식 6개 평균 **1.33배** 개선
+  (CPU에서, 새 드라이버·패키지 충돌 없이).
+- `ocr.py`에 `_get_quantized_mfr_dir()` 추가 - `%APPDATA%\pix2text`에 pix2text가
+  이미 받아둔(또는 그 시점에 처음 받는) 원본 FP32 모델을 찾아 INT8 사본을
+  한 번만 만들어 캐시해두고, 이후에는 그 사본 경로를 재사용한다(다른 지연 로딩
+  싱글턴들과 같은 패턴). `get_formula_ocr_model()`이 `Pix2Text.from_config()`
+  호출 시 `total_configs={'text_formula': {'formula': {'model_dir': ...}}}`로
+  MFR만 이 양자화 사본을 쓰도록 지정 - 레이아웃/MFD/표 구조 모델은 그대로.
+  캐시 없는 상태에서 첫 로드(양자화 포함) 18초, 이후에는 캐시 재사용으로
+  일반 모델 로딩과 동일한 시간.
+
+**변경 파일**
+- `backend/ocr.py`
+
+---
+
 ## 아직 처리 안 된 것으로 남아있는 이슈
 
 - 어떤 문제의 수식에서 `a \stackrel{2}{\iota} = 0` 형태 발견 — `a^2 = 0`이
