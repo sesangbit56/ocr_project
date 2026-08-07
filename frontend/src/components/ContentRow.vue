@@ -55,6 +55,22 @@
         <img v-if="content.image_url" :src="content.image_url" alt="" />
         <span v-else class="image-preview-placeholder">Adjust region to crop the image</span>
       </div>
+      <table v-else-if="content.type === 'table'" class="table-editor">
+        <tbody>
+          <tr v-for="(row, ri) in tableData.cells" :key="ri">
+            <td v-for="(cell, ci) in row" :key="ci">
+              <button
+                type="button"
+                class="cell-type-toggle"
+                :class="cell.type"
+                :title="`Cell type: ${cell.type} (click to toggle text/formula)`"
+                @click="toggleCellType(cell)"
+              >{{ cell.type === 'formula' ? 'ƒ' : 'T' }}</button>
+              <input type="text" class="cell-input" v-model="cell.content" @input="syncTableContent" />
+            </td>
+          </tr>
+        </tbody>
+      </table>
       <math-field
         v-else
         class="math-field-input row-content-field"
@@ -103,10 +119,12 @@
 </template>
 
 <script setup>
-const CHOICE_LABELS = ['①', '②', '③', '④', '⑤']
-const CONTENT_TYPES = ['text', 'formula', 'choice', 'image']
+import { ref, watch } from 'vue'
 
-defineProps({
+const CHOICE_LABELS = ['①', '②', '③', '④', '⑤']
+const CONTENT_TYPES = ['text', 'formula', 'choice', 'image', 'table']
+
+const props = defineProps({
   content: { type: Object, required: true },
   reordering: { type: Boolean, default: false },
   flagged: { type: Boolean, default: false },
@@ -124,6 +142,45 @@ defineProps({
   showLineBreakToggle: { type: Boolean, default: false },
 })
 defineEmits(['delete', 'adjust-region', 'type-change', 'drag-start', 'drag-over', 'drag-leave', 'drop', 'drag-end'])
+
+// A type="table" row's content field holds a JSON string
+// ({rows, cols, cells: [[{type, content}, ...], ...]}) rather than plain
+// text/LaTeX like every other type - the recognition pipeline emits this
+// shape directly (see _extract_table_region in backend/ocr.py). Parsed
+// into a local, directly-editable structure once and re-serialized back
+// into content.content on every cell edit, the same "mutate the shared
+// content object" pattern the plain fields above already use.
+const parseTableContent = (raw) => {
+  try {
+    const data = JSON.parse(raw || '{}')
+    if (Array.isArray(data.cells)) return data
+  } catch (err) {
+    // Not valid table JSON (e.g. a stray edit, or a row that hasn't been
+    // re-recognized as a table yet) - fall through to an empty grid.
+  }
+  return { rows: 0, cols: 0, cells: [] }
+}
+
+const tableData = ref(parseTableContent(props.content.content))
+
+// Re-parse if the underlying content string changes from outside this
+// component (re-recognition, "revert to initial OCR", switching which
+// problem is open) rather than from a cell edit here.
+watch(
+  () => props.content.content,
+  (raw) => {
+    if (props.content.type === 'table') tableData.value = parseTableContent(raw)
+  }
+)
+
+const syncTableContent = () => {
+  props.content.content = JSON.stringify(tableData.value)
+}
+
+const toggleCellType = (cell) => {
+  cell.type = cell.type === 'formula' ? 'text' : 'formula'
+  syncTableContent()
+}
 
 // Tab jumps straight to the next row's content field (textarea or
 // math-field), skipping the label input, type dropdown, checkboxes, and
@@ -338,6 +395,44 @@ const onFieldKeydown = (event) => {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.table-editor {
+  flex: 1;
+  min-width: 8rem;
+  border-collapse: collapse;
+}
+
+.table-editor td {
+  border: 1px solid #e5e7eb;
+  padding: 0.2rem;
+}
+
+.cell-type-toggle {
+  flex-shrink: 0;
+  width: 1.4rem;
+  height: 1.4rem;
+  margin-right: 0.2rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  border: 1px solid #d1d5db;
+  border-radius: 0.3rem;
+  background: #f3f4f6;
+  color: #374151;
+  cursor: pointer;
+}
+
+.cell-type-toggle.formula {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.cell-input {
+  width: 5rem;
+  font-size: 0.85rem;
+  padding: 0.2rem 0.3rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.3rem;
 }
 
 .image-preview img {

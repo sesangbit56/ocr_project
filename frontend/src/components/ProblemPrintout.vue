@@ -12,6 +12,13 @@
           <span v-else-if="ci > 0 && !skipGapBefore(childrenOf(item.id)[ci - 1], child)">&nbsp;</span>
           <span v-if="child.label" class="row-label">{{ child.label }}.</span>
           <img v-if="child.type === 'image'" :src="child.image_url" class="inline-image" />
+          <table v-else-if="child.type === 'table'" class="content-table">
+            <tbody>
+              <tr v-for="(row, ri) in parsedTable(child).cells" :key="ri">
+                <td v-for="(cell, ci) in row" :key="ci" v-html="renderCellHtml(cell)"></td>
+              </tr>
+            </tbody>
+          </table>
           <span v-else class="inline-content" v-html="renderContentHtml(child)"></span>
         </template>
       </div>
@@ -22,10 +29,24 @@
           <span v-else-if="ci > 0 && !skipGapBefore(childrenOf(item.id)[ci - 1], child)">&nbsp;</span>
           <span v-if="child.label" class="row-label">{{ child.label }}.</span>
           <img v-if="child.type === 'image'" :src="child.image_url" class="inline-image" />
+          <table v-else-if="child.type === 'table'" class="content-table">
+            <tbody>
+              <tr v-for="(row, ri) in parsedTable(child).cells" :key="ri">
+                <td v-for="(cell, ci) in row" :key="ci" v-html="renderCellHtml(cell)"></td>
+              </tr>
+            </tbody>
+          </table>
           <span v-else class="inline-content" v-html="renderContentHtml(child)"></span>
         </template>
       </div>
       <img v-else-if="item.type === 'image'" :src="item.image_url" class="inline-image" />
+      <table v-else-if="item.type === 'table'" class="content-table">
+        <tbody>
+          <tr v-for="(row, ri) in parsedTable(item).cells" :key="ri">
+            <td v-for="(cell, ci) in row" :key="ci" v-html="renderCellHtml(cell)"></td>
+          </tr>
+        </tbody>
+      </table>
       <span v-else class="inline-content" v-html="renderContentHtml(item)"></span>
     </template>
 
@@ -208,6 +229,28 @@ const renderContentHtml = (content) => {
   }
   return ''
 }
+
+// A type="table" row's content field holds a JSON string ({rows, cols,
+// cells: [[{type, content}, ...], ...]}) rather than plain text/LaTeX -
+// see _extract_table_region in backend/ocr.py, the recognition step that
+// produces this shape. Parsed defensively since a table row can exist
+// before recognition has ever run on it (empty placeholder) or, in
+// principle, hold a stray non-JSON edit.
+const parsedTable = (item) => {
+  try {
+    const data = JSON.parse(item.content || '{}')
+    if (Array.isArray(data.cells)) return data
+  } catch (err) {
+    // fall through to an empty table below
+  }
+  return { rows: 0, cols: 0, cells: [] }
+}
+
+const renderCellHtml = (cell) => {
+  if (!cell) return ''
+  if (cell.type === 'formula') return renderMath(cell.content, false)
+  return escapeHtml(cell.content)
+}
 </script>
 
 <style scoped>
@@ -236,6 +279,17 @@ const renderContentHtml = (content) => {
 .inline-image {
   max-width: 100%;
   vertical-align: middle;
+}
+
+.content-table {
+  border-collapse: collapse;
+  margin: 0.6em auto;
+}
+
+.content-table td {
+  border: 1px solid #333;
+  padding: 0.3em 0.6em;
+  text-align: center;
 }
 
 .content-group {
