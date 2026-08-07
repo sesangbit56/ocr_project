@@ -12,6 +12,10 @@
       <button class="top-tab" :class="{ active: view === 'review-queue' }" @click="view = 'review-queue'">
         Review Queue ({{ reviewQueueCount }})
       </button>
+      <span class="ocr-status" :class="{ active: ocrStatus.active }" :title="ocrStatusTitle">
+        <span class="ocr-status-dot"></span>
+        {{ ocrStatusLabel }}
+      </span>
     </nav>
 
     <template v-if="view === 'list'">
@@ -53,7 +57,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import DocumentUpload from './components/DocumentUpload.vue'
 import DocumentList from './components/DocumentList.vue'
 import PageViewer from './components/PageViewer.vue'
@@ -69,6 +73,7 @@ const selectedDocumentId = ref(null)
 const selectedPageId = ref(null)
 const regionQueueCount = ref(0)
 const reviewQueueCount = ref(0)
+const ocrStatus = ref({ active: false, current: null, queued: 0 })
 // Remembers which view opened the guide, so closing it returns to wherever
 // it was opened from ('review' or 'review-queue') instead of always going
 // back to the standalone review view.
@@ -87,6 +92,34 @@ const fetchQueueCounts = async () => {
   regionQueueCount.value = regions.length
   reviewQueueCount.value = reviews.length
 }
+
+// OCR runs in a background worker independent of whatever view is on
+// screen (see _ocr_worker_loop in app.py), so unlike the queue badges
+// above this has to poll on a timer rather than just refresh on
+// navigation - otherwise there's no way to tell "still working" from
+// "stuck" without leaving the page open on a queue view.
+const fetchOcrStatus = async () => {
+  try {
+    const response = await fetch('/api/ocr/status')
+    ocrStatus.value = await response.json()
+  } catch (err) {
+    // A transient fetch failure (e.g. dev server restarting) shouldn't
+    // wipe out the last known status - just skip this tick.
+  }
+}
+
+const ocrStatusLabel = computed(() => {
+  if (!ocrStatus.value.active) return 'OCR idle'
+  const current = ocrStatus.value.current
+  const where = current ? `${current.document_filename ?? '?'} p.${current.page_number ?? '?'}` : '...'
+  return `OCR: ${where} (+${ocrStatus.value.queued} queued)`
+})
+
+const ocrStatusTitle = computed(() =>
+  ocrStatus.value.active
+    ? 'Background OCR is currently processing a page/region'
+    : 'No OCR work in progress right now'
+)
 
 const onUploaded = () => {
   fetchDocuments()
@@ -156,9 +189,17 @@ const backFromGuide = () => {
   view.value = previousView.value
 }
 
+let ocrStatusTimer = null
+
 onMounted(() => {
   fetchDocuments()
   fetchQueueCounts()
+  fetchOcrStatus()
+  ocrStatusTimer = setInterval(fetchOcrStatus, 2000)
+})
+
+onUnmounted(() => {
+  if (ocrStatusTimer) clearInterval(ocrStatusTimer)
 })
 // Cheap enough at this scale to just refresh on every navigation - keeps
 // the tab badges accurate without needing polling or a push mechanism.
@@ -207,6 +248,43 @@ h1 {
   border-color: #2563eb;
   background: #eff6ff;
   color: #2563eb;
+}
+
+.ocr-status {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+  padding: 0.4rem 0.8rem;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  background: #f3f4f6;
+  color: #6b7280;
+  white-space: nowrap;
+}
+.ocr-status.active {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+.ocr-status-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: #9ca3af;
+  flex-shrink: 0;
+}
+.ocr-status.active .ocr-status-dot {
+  background: #2563eb;
+  animation: ocr-status-pulse 1.2s ease-in-out infinite;
+}
+@keyframes ocr-status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
 }
 
 @media print {

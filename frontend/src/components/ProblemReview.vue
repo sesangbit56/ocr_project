@@ -87,10 +87,10 @@
                     >{{ revertingContent ? 'Reverting...' : 'Revert to initial OCR result' }}</button>
                     <button
                       class="reset-button"
-                      :disabled="resettingContent"
+                      :disabled="resettingContent || currentProblem.status === 'pending'"
                       title="Discard all edits and re-run OCR on this problem's original crop"
                       @click="resetToInitialRecognition(currentProblem)"
-                    >{{ resettingContent ? 'Re-running...' : 'Re-run OCR' }}</button>
+                    >{{ resettingContent || currentProblem.status === 'pending' ? 'Re-running...' : 'Re-run OCR' }}</button>
                   </div>
                 </div>
 
@@ -599,9 +599,21 @@ const revertToInitialSnapshot = async (problem) => {
   }
 }
 
+// Recognition now runs on the shared background OCR worker (see
+// /recognize in app.py) instead of inline in this request - the model
+// call can take minutes, and blocking on it here meant a reviewer who
+// navigated to a different problem while waiting had no way to tell
+// "problem X is still being re-recognized" from "stuck", since the
+// disabled/"Re-running..." state was only ever local to this one
+// function call. The POST now just queues the job and comes back with
+// status: 'pending' right away; the button's own disabled state reads
+// problem.status directly (see the template) so it stays correct across
+// navigation, and the existing stillRecognizing/startPollingIfNeeded
+// polling loop (already used for the initial per-page recognition pass)
+// picks up problem.contents once the worker actually finishes.
 const resettingContent = ref(false)
 const resetToInitialRecognition = async (problem) => {
-  if (!problem || resettingContent.value) return
+  if (!problem || resettingContent.value || problem.status === 'pending') return
   const ok = window.confirm(
     'Discard all edits to this problem and re-run OCR on its original crop?'
   )
@@ -610,9 +622,8 @@ const resetToInitialRecognition = async (problem) => {
   try {
     const response = await fetch(`/api/problems/${problem.id}/recognize`, { method: 'POST' })
     const updated = await response.json()
-    problem.contents = updated.contents
     problem.status = updated.status
-    problem.has_initial_snapshot = true
+    startPollingIfNeeded()
   } finally {
     resettingContent.value = false
   }
