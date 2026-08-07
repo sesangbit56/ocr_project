@@ -417,7 +417,67 @@ def _recognize_pixel_region(img):
                 "confidence": round(confidence, 2),
             }
         )
-    return segments
+    return _fix_array_hallucinations(img, segments)
+
+
+# 선지 다섯 개가 한 줄에 촘촘히 붙어있는 영역을 통짜로 넣으면, MFR이 가끔
+# 이걸 표처럼 착각해서 "\begin{array}{c c c c...}" 안에 \textcircled/\oplus
+# 잡음 기호를 수십 개 욱여넣는 환각을 일으키는 걸 실측으로 확인했다(mfr_batch_size
+# 실험 중 우연히 발견). 이 앱이 다루는 문제 지문/선지에는 array/matrix
+# 서식이 정상적으로 나올 일이 없다 - 진짜 표는 TABLE 레이아웃 경로
+# (_extract_table_region)로 따로 처리되지, 이 통짜 스캔 경로를 거치지
+# 않는다. 그래서 이 경로에서 나온 formula 세그먼트에 "\begin{array}"가
+# 있으면 사실상 100% 이 환각으로 봐도 된다.
+ARRAY_HALLUCINATION_RE = re.compile(r"\\begin\{array\}")
+
+# 이 너비보다 좁아지면 반으로 쪼개봐야 원래도 좁았던 영역이라 의미가
+# 없다고 보고 재시도를 포기한다 - 무한정 쪼개려 드는 것도 막는다.
+_ARRAY_RETRY_MIN_WIDTH = 40
+
+
+def _fix_array_hallucinations(img, segments):
+    result = []
+    for seg in segments:
+        if seg["type"] == "formula" and ARRAY_HALLUCINATION_RE.search(seg["content"]):
+            retried = _retry_split_region(img, seg)
+            if retried is not None:
+                result.extend(retried)
+                continue
+        result.append(seg)
+    return result
+
+
+def _retry_split_region(img, seg):
+    # 같은 크롭을 그대로 다시 넣으면 모델이 결정론적이라 똑같은 환각이
+    # 또 나올 뿐이다 - 대신 영역을 좌우로 반씩 쪼개서 각각 따로 인식시킨다.
+    # 선지 다섯 개가 한꺼번에 보여서 표처럼 착각하는 게 원인으로 보이니,
+    # 한 번에 보여주는 항목 수를 줄이면(반쪽엔 2~3개만) 그 착시를 피할
+    # 가능성이 높다 - _figure_region_is_actually_text가 "좁게 잘라서
+    # 다시 보여주면 더 잘 읽는다"는 걸 이미 확인한 것과 같은 원리다.
+    # 재시도 결과에도 여전히 환각이 남아있으면(반쪽도 여전히 복잡한
+    # 경우) None을 돌려줘서 호출한 쪽이 원본을 그대로 쓰게 한다 -
+    # 어차피 이미 망가진 값이라 더 나빠질 것도 없다.
+    x0, y0, w, h = seg["bbox_x"], seg["bbox_y"], seg["bbox_w"], seg["bbox_h"]
+    if w < _ARRAY_RETRY_MIN_WIDTH:
+        return None
+
+    mid = w // 2
+    left_crop = img.crop((x0, y0, x0 + mid, y0 + h))
+    right_crop = img.crop((x0 + mid, y0, x0 + w, y0 + h))
+    left_segments = _recognize_pixel_region(left_crop)
+    right_segments = _recognize_pixel_region(right_crop)
+
+    for s in left_segments:
+        s["bbox_x"] += x0
+        s["bbox_y"] += y0
+    for s in right_segments:
+        s["bbox_x"] += x0 + mid
+        s["bbox_y"] += y0
+
+    combined = left_segments + right_segments
+    if any(s["type"] == "formula" and ARRAY_HALLUCINATION_RE.search(s["content"]) for s in combined):
+        return None
+    return combined
 
 
 def recognize_scanned_problem_region(problem):
@@ -509,7 +569,7 @@ def _figure_region_is_actually_text(problem_img, x0, y0, w, h):
 # 모양일 때만 각 조각을 choice 세그먼트로 되돌린다 - 마커 글리프
 # 자체는 못 믿으므로 라벨은 비워두고, choice 타입으로 바로 만들어두면
 # relabel_choice_row가 x좌표 순으로 ①②③④⑤를 다시 매겨준다.
-_CHOICE_GLOB_ITEM_RE = re.compile(r"^\\[a-zA-Z]+\s*(?:\\[,;:]|\\\s)*\s*(.*)$", re.DOTALL)
+_CHOICE_GLOB_ITEM_RE = re.compile(r"^\\[a-zA-Z]+(?:\{[^{}]*\})?\s*(?:\\[,;:]|\\\s)*\s*(.*)$", re.DOTALL)
 
 
 def expand_choice_glob_segments(segments):
@@ -523,16 +583,30 @@ def expand_choice_glob_segments(segments):
             result.append(seg)
             continue
         items = [_CHOICE_GLOB_ITEM_RE.match(p) for p in pieces]
-        if not all(items):
+        # 원래는 조각 전부가 마커로 시작해야만 이 뭉치를 선지로 인정했는데,
+        # 실측해보니 첫 선지의 마커만 따로 떨어져 나가 별도 세그먼트("0"
+        # 같은 값)가 되고 이 수식엔 값만 마커 없이 남는 경우가 있었다
+        # (그 경우 조각 전부 매칭을 요구하면 통째로 포기하고 원본 그대로
+        # 저장돼버림). 그래서 과반수만 마커로 시작하면 선지 뭉치로 보고,
+        # 마커가 없는 조각은 내용을 그대로 값으로 쓴다 - 반대로 과반
+        # 미만이면(수식 안에 우연히 \qquad가 들어간 경우 등) 손대지 않는다.
+        if sum(1 for m in items if m) < len(pieces) / 2:
             result.append(seg)
             continue
         slot_w = seg["bbox_w"] / len(pieces)
-        for idx, m in enumerate(items):
+        for idx, (piece, m) in enumerate(zip(pieces, items)):
+            content = clean_latex(m.group(1) if m else piece)
+            # 마커만 있고 값이 없던 조각(예: 마지막 선지가 인식 자체를
+            # 실패한 경우)은 마커를 벗겨내고 나면 떠돌이 백슬래시나 마침표
+            # 같은 잡음만 남는다 - 숫자/글자가 하나도 없으면 선지 값으로
+            # 볼 수 없으므로 버린다.
+            if not re.search(r"[0-9A-Za-z가-힣]", content):
+                continue
             result.append(
                 {
                     "type": "choice",
                     "label": None,
-                    "content": clean_latex(m.group(1)),
+                    "content": content,
                     "bbox_x": seg["bbox_x"] + round(idx * slot_w),
                     "bbox_y": seg["bbox_y"],
                     "bbox_w": round(slot_w),
@@ -778,8 +852,12 @@ STRAY_EQUALS_STACKREL_RE = re.compile(r"\\stackrel\{[^{}]*\}\s*\{\s*=\s*\}|\\sta
 # 이 앱이 다루는 문제 지문에는 볼드체로 강조된 부분이 원래 없다 - OCR이
 # 가끔 이유 없이 특정 글자/기호를 \mathbf 등으로 잘못 인식한다(실제
 # 출력에서 \mathbf{\Sigma}, \mathbf{\alpha} 같은 경우를 확인했다).
-# 명령어와 중괄호만 벗겨내고 안의 내용은 그대로 남긴다.
-BOLD_WRAPPER_RE = re.compile(r"\\(?:mathbf|boldsymbol|textbf|bold)\{([^{}]*)\}")
+# 명령어와 중괄호만 벗겨내고 안의 내용은 그대로 남긴다. 인자 안에
+# \frac{2}{3}처럼 중괄호가 한 겹 더 있는 경우(예: \mathbf{-\frac{2}{3}})도
+# 실제로 나오는 걸 확인해서, 중괄호 없는 부분과 한 겹짜리 중첩 그룹을
+# 번갈아 반복 매칭하도록 함 - 원래는 [^{}]*라 중첩 중괄호가 하나라도
+# 있으면 아예 매칭이 안 되고 볼드가 그대로 남았다.
+BOLD_WRAPPER_RE = re.compile(r"\\(?:mathbf|boldsymbol|textbf|bold)\{((?:[^{}]|\{[^{}]*\})*)\}")
 
 # {\bf ...} 처럼 중괄호 없이 그 뒤 전체에 볼드를 적용하는 옛 스타일
 # 선언형 명령 - 명령어 토큰만 지우면 나머지 내용과 감싸는 중괄호는
