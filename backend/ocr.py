@@ -317,7 +317,9 @@ def analyze_problem_layout(problem):
 
     img = Image.open(os.path.join(upload_dir, problem.crop_path)).convert("RGB")
     model = get_formula_ocr_model()
-    layout_out, _ = model.layout_parser.parse(img.copy(), resized_shape=768, table_as_image=False)
+    # layout_parser.parse()가 내부적으로 img.convert("RGB")를 호출해서
+    # 어차피 사본을 만들기 때문에, 여기서 미리 .copy()를 해둘 필요는 없다.
+    layout_out, _ = model.layout_parser.parse(img, resized_shape=768, table_as_image=False)
 
     ignored_types = {ElementType.TITLE, ElementType.ABANDONED, ElementType.IGNORED, ElementType.UNKNOWN}
     kind_by_type = {
