@@ -826,8 +826,24 @@ def recognize_problem_regions(document, page, problem):
 # pix2text가 그 외에는 멀쩡한 결과물 안에 가끔 환각으로 끼워 넣는
 # 토큰들 - 고등학교 이하 수준 수학 문제에는 사실상 등장할 일이 없는,
 # 범주론/모델이론 계열의 낯선 기호들(\models, \sharp 등). 모델이 애초에
-# 이런 걸 뱉지 않도록 막으려 하는 대신, 후처리로 제거한다.
-JUNK_LATEX_COMMANDS = [r"\models", r"\bigstar", r"\boxplus", r"\nsubseteq", r"\boldmath", r"\sharp", r"\circ", r"\S", r"\Phi"]
+# 이런 걸 뱉지 않도록 막으려 하는 대신, 후처리로 제거한다. \hfill은 이
+# 부류와 좀 다른데, 낯선 기호가 아니라 원본 조판에서 케이스별 정의식
+# (\begin{matrix}...) 각 줄을 오른쪽으로 밀어 정렬하던 TeX 레이아웃
+# 명령이 그대로 섞여 나온 것 - 수식 내용이 아니라 순전히 간격 조정용이라
+# 마찬가지로 의미 없이 제거해도 안전하다(실제 사례:
+# "a_{n}\!+\!1~~(a_{n}<3)\hfill" 형태로 등장했음을 확인).
+JUNK_LATEX_COMMANDS = [
+    r"\models",
+    r"\bigstar",
+    r"\boxplus",
+    r"\nsubseteq",
+    r"\boldmath",
+    r"\sharp",
+    r"\circ",
+    r"\S",
+    r"\Phi",
+    r"\hfill",
+]
 JUNK_LATEX_COMMANDS_WITH_ARG = [r"\mathfrak"]
 
 # 프라임 기호("f'(x)")가 OCR 모델에서 위첨자의 위첨자로 나오는 경우가
@@ -837,6 +853,12 @@ JUNK_LATEX_COMMANDS_WITH_ARG = [r"\mathfrak"]
 # 단일 위첨자로 평탄화하면, 원래 자리에 정상적인 프라임 모양으로
 # 렌더링된다.
 NESTED_PRIME_RE = re.compile(r"\^\{[^{}]*\^\{(\\prime+)\}[^{}]*\}")
+
+# 거듭제곱근을 "\root n \of x"(plain TeX 문법)로 뱉는 경우가 있다 - KaTeX는
+# \root/\of를 아예 모르는 명령이라 렌더링이 깨지고 빨간 글씨로 그대로
+# 노출된다(실제 사례: "\root3 \of{2}", "\root4 \of{8}"). KaTeX가 지원하는
+# \sqrt[n]{x}로 바꿔준다.
+ROOT_OF_RE = re.compile(r"\\root\s*(\d+|\{[^{}]*\})\s*\\of\s*(\d+|[a-zA-Z]|\{[^{}]*\})")
 
 # \stackrel{.}{X}는 X 위에 점을 그린다 - 의도된 표기가 아니라 OCR이
 # 만들어낸 아티팩트다(실제 출력을 대조 확인해본 결과, "=" 위의 "≐"도,
@@ -864,6 +886,18 @@ BOLD_WRAPPER_RE = re.compile(r"\\(?:mathbf|boldsymbol|textbf|bold)\{((?:[^{}]|\{
 # 그대로 남아 볼드만 해제된다.
 BOLD_DECLARATION_RE = re.compile(r"\\bf\s*")
 
+# \underline{}/\overline{}에 밑줄/윗줄 칠 내용이 아예 없는 경우 - OCR이
+# 선분 표기(예: 위에 선 그은 AB) 일부를 놓치고 빈 명령어만 남기는 걸
+# 확인했다. 중괄호만 비우면(다른 빈 그룹처럼) \underline/\overline이
+# 인자 없이 남아 KaTeX 렌더링이 깨지므로, 명령어까지 통째로 제거한다.
+EMPTY_LINE_WRAPPER_RE = re.compile(r"\\(?:underline|overline)\{\s*\}")
+
+
+def _unwrap_braces(s):
+    if s.startswith("{") and s.endswith("}"):
+        return s[1:-1]
+    return s
+
 
 def clean_latex(latex):
     if not latex:
@@ -874,6 +908,9 @@ def clean_latex(latex):
     for cmd in JUNK_LATEX_COMMANDS:
         cleaned = re.sub(re.escape(cmd) + r"\b", "", cleaned)
     cleaned = NESTED_PRIME_RE.sub(r"^{\1}", cleaned)
+    cleaned = ROOT_OF_RE.sub(
+        lambda m: f"\\sqrt[{_unwrap_braces(m.group(1))}]{{{_unwrap_braces(m.group(2))}}}", cleaned
+    )
     cleaned = STRAY_DOT_STACKREL_RE.sub(r"\1", cleaned)
     cleaned = STRAY_EQUALS_STACKREL_RE.sub("=", cleaned)
     # 볼드 래퍼는 중첩될 수 없다는 보장이 없으니(예: \mathbf{\mathbf{X}}는
@@ -885,6 +922,7 @@ def clean_latex(latex):
             break
         cleaned = stripped
     cleaned = BOLD_DECLARATION_RE.sub("", cleaned)
+    cleaned = EMPTY_LINE_WRAPPER_RE.sub("", cleaned)
     cleaned = re.sub(r"\{\s*\}", "", cleaned)  # 위 치환 후 남은 빈 그룹 제거
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
