@@ -673,6 +673,53 @@ autoregressive 디코더라 적합하지 않다고 판단, 실측 없이 기각.
 
 ---
 
+## 14. OCR 작업 시간 로깅 확충 + `recognize_page()`의 중복 인식 제거 (2026-08-07)
+
+**OCR 큐 작업 시작/종료 타임스탬프**
+- "지금 등록된 문제 2개 OCR이 얼마나 걸렸냐"는 질문에 서버 로그를 손으로
+  역추적해야 했던 것을 계기로, `backend/app.py`의 `_ocr_worker_loop`(모든
+  종류의 OCR 작업이 거쳐가는 단일 지점)에 시작/종료 로그 추가 -
+  `[OCR] {kind} task started/finished in Xs: {task}` 형태로 `server.log`에
+  바로 남음.
+
+**`recognize_page()`가 버려지는 인식 결과를 만드느라 시간을 낭비하고 있던 문제**
+- 파이프라인 각 단계(레이아웃 분석/그림·표 처리/통짜 스캔/선지 복구)에
+  타임스탬프를 걸고 실제 등록된 문제 2개로 다시 분석하다가, "레이아웃 분석"
+  단계가 그 자체 로그(예: `976.1ms`)와 무관하게 문제당 20~30초씩 걸리는
+  이상한 현상을 발견.
+- pix2text 소스(`pix_to_text.py`의 `recognize_page`)를 직접 읽어서 원인
+  확인: `recognize_page()`는 단순 레이아웃(박스+타입) 검출기가 아니라,
+  검출된 영역마다 **내용까지 전부 인식**(TEXT/TITLE 영역엔 MFD+MFR, TABLE
+  영역엔 표 구조+셀 내용, FORMULA 영역엔 MFR)하는 함수였음.
+  `analyze_problem_layout`은 그 결과에서 `type`/`box`만 쓰고 인식된 내용
+  (`el.text`)은 전부 버리고 있었다 - 즉 **MFR을 문제당 사실상 두 번
+  돌리고 있었다**(레이아웃 단계에서 한 번, 나중에 통짜 스캔에서 한 번).
+- 직접 대조 실측: 같은 이미지에 `model.layout_parser.parse()`(레이아웃만)는
+  2.28초, `model.recognize_page()`(내용까지)는 17.51초 - 반환하는 박스
+  개수/타입은 동일(7개, TEXT/FORMULA/IGNORED). 차액이 전부 버려지는
+  인식 결과를 만드는 데 쓰이고 있었음이 확인됨.
+- **수정**: `analyze_problem_layout`이 `recognize_page()` 대신
+  `model.layout_parser.parse()`를 직접 호출하도록 교체. TABLE 영역만
+  셀 구조가 필요해서 예외적으로 `model.table_ocr.recognize(crop,
+  out_cells=True, ...)`을 그 영역에 한해 직접 호출 - `recognize_page()`와
+  동일하게 10px 여백을 두고 크롭한다(셀 bbox 좌표계가 이 확장된 크롭
+  기준이라 여백을 안 맞추면 셀 위치가 어긋남). `_extract_table_region`의
+  첫 인자를 `Element` 객체 대신 `table_ocr.recognize()`가 반환한 dict를
+  바로 받도록 정리(`element.meta` → `table_meta`로 이름도 변경).
+- **검증**: 실제 등록된 문제 2개, 순수 인식 시간(모델 워밍업 제외) 기준
+  175.93초 → 142.36초 (**약 19% 절감, 33.57초**). 세그먼트 개수(19개,
+  45개)는 수정 전후 정확히 동일 - 인식 결과 변화 없이 낭비만 제거.
+  표(TABLE) 경로는 지금 등록된 문제에 표가 없어서 이번 실측으로는
+  검증 못 함 - `recognize_page()` 내부 코드를 그대로 옮긴 것이라 논리적으로는
+  동일해야 하지만, 실제 표 있는 문제로는 아직 미확인.
+- 조사 과정과 다른 시도(DirectML/NPU/KV캐시/양자화/배치)까지 포함한 전체
+  기록은 `speed_optimization.md`에 정리.
+
+**변경 파일**
+- `backend/app.py`, `backend/ocr.py`
+
+---
+
 ## 아직 처리 안 된 것으로 남아있는 이슈
 
 - 어떤 문제의 수식에서 `a \stackrel{2}{\iota} = 0` 형태 발견 — `a^2 = 0`이

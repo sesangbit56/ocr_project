@@ -607,6 +607,8 @@ def _ocr_worker_loop():
         key, task = _ocr_task_queue.get()
         with _ocr_queue_lock:
             _ocr_current_task = task
+        started_at = time.time()
+        print(f"[OCR] {task['kind']} task started: {task}")
         try:
             with app.app_context():
                 try:
@@ -633,6 +635,11 @@ def _ocr_worker_loop():
             # thread and silently stop everything queued behind it.
             pass
         finally:
+            # 작업 하나가 실제로 몇 초 걸렸는지 로그에서 바로 보이도록 -
+            # 이전에는 시작/종료 표시가 없어서, 인식 로그 뭉치 사이에서
+            # 타임스탬프를 손으로 추적해야만 소요 시간을 알 수 있었다.
+            elapsed = time.time() - started_at
+            print(f"[OCR] {task['kind']} task finished in {elapsed:.1f}s: {task}")
             with _ocr_queue_lock:
                 _ocr_queued_keys.discard(key)
                 _ocr_current_task = None

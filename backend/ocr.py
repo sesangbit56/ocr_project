@@ -270,9 +270,26 @@ def get_text_ocr_reader():
 
 
 def analyze_problem_layout(problem):
-    # 문제 크롭 이미지에 pix2text의 전체 페이지 레이아웃 분석기
-    # (recognize_page)를 돌려서, 텍스트/수식/그림/표로 타입이 붙은
-    # 하위 영역 목록을 얻는다. 이게 이제 인식의 첫 단계다.
+    # 문제 크롭 이미지에 pix2text의 레이아웃 분석기를 돌려서, 텍스트/수식/
+    # 그림/표로 타입이 붙은 하위 영역(박스+타입)만 얻는다. 이게 인식의
+    # 첫 단계다.
+    #
+    # model.recognize_page()가 아니라 model.layout_parser.parse()를 직접
+    # 부른다 - recognize_page()는 레이아웃 검출뿐 아니라 검출된 영역마다
+    # 내용까지 전부 인식(TEXT/TITLE 영역엔 MFD+MFR, TABLE 영역엔 표 구조+
+    # 셀 내용, FORMULA 영역엔 MFR)하는 훨씬 무거운 함수인데, 여기서는
+    # 그 결과에서 타입/좌표만 쓰고 인식된 내용은 전부 버리고 있었다
+    # (표를 제외한 나머지는 뒤에서 recognize_problem_regions가 통짜
+    # 스캔으로 다시 인식하므로 필요가 없다). 실측 결과 문제 하나당
+    # recognize_page()는 17초, layout_parser.parse()만 쓰면 2초대로,
+    # 그 차이(약 15초)가 전부 버려지는 인식 결과를 만드는 데 쓰이고
+    # 있었다 - 정확도 변화 없이(버리던 값이므로) 그대로 걷어낸다.
+    #
+    # TABLE 영역만 예외 - 셀 구조(행/열/셀별 bbox)가 필요해서, 그 영역만
+    # recognize_page()와 동일한 방식(10px 여백을 두고 크롭 후
+    # table_ocr.recognize)으로 직접 다시 부른다. 이때 셀 bbox가 이
+    # 확장된 크롭 기준 좌표로 나오므로, region의 x0/y0/w/h도 반드시
+    # 이 확장된 값을 그대로 써야 나중에 셀 크롭 좌표가 어긋나지 않는다.
     #
     # 예전에는 "이 문제 영역에 추출 가능한 PDF 텍스트 레이어가 있는가"로
     # 두 경로(recognize_problem_regions vs recognize_scanned_problem_region)
@@ -296,10 +313,11 @@ def analyze_problem_layout(problem):
     # 같은 섹션 라벨, "확인 사항" 안내 박스, 페이지 번호 등 문제 내용이
     # 아닌 부속물)은 제외한다.
     from pix2text.page_elements import ElementType
+    from pix2text.utils import box2list
 
     img = Image.open(os.path.join(upload_dir, problem.crop_path)).convert("RGB")
     model = get_formula_ocr_model()
-    layout_page = model.recognize_page(img)
+    layout_out, _ = model.layout_parser.parse(img.copy(), resized_shape=768, table_as_image=False)
 
     ignored_types = {ElementType.TITLE, ElementType.ABANDONED, ElementType.IGNORED, ElementType.UNKNOWN}
     kind_by_type = {
@@ -308,19 +326,30 @@ def analyze_problem_layout(problem):
         ElementType.FORMULA: "formula",
     }
 
-    elements = [el for el in layout_page.elements if el.type not in ignored_types]
-    elements.sort()  # Element.__lt__가 다열(column) 인식 읽기 순서를 이미 구현하고 있다
+    boxes = [b for b in layout_out if b["type"] not in ignored_types]
+    # DocYoloLayoutParser가 이미 col_number(다열 인식 열 순서)를 매겨주므로,
+    # (열, 세로 위치) 순으로 정렬하면 읽기 순서가 된다 - Element.__lt__가
+    # 하던 것과 동일한 기준.
+    boxes.sort(key=lambda b: (b["col_number"], box2list(b["position"])[1]))
 
     regions = []
-    for el in elements:
-        x0, y0, x1, y1 = (int(round(v)) for v in el.box)
+    for box_info in boxes:
+        x0, y0, x1, y1 = box2list(box_info["position"])
+        kind = kind_by_type.get(box_info["type"], "text")
+        table_meta = None
+        if kind == "table":
+            margin = 10
+            x0, y0 = max(0, x0 - margin), max(0, y0 - margin)
+            x1, y1 = min(img.width, x1 + margin), min(img.height, y1 + margin)
+            crop = img.crop((x0, y0, x1, y1))
+            table_meta = model.table_ocr.recognize(crop, out_cells=True, out_markdown=True, out_html=True)
         w, h = x1 - x0, y1 - y0
         if w <= 0 or h <= 0:
             continue
         # TEXT가 기본값 - 레이아웃 분석기가 놓친/애매한 타입도 일단
         # 평문 취급해서 문자 분류 파이프라인을 태우는 쪽이, 조용히
         # 버리는 것보다 안전하다.
-        regions.append({"kind": kind_by_type.get(el.type, "text"), "x": x0, "y": y0, "w": w, "h": h, "element": el})
+        regions.append({"kind": kind, "x": x0, "y": y0, "w": w, "h": h, "table_meta": table_meta})
     return img, regions
 
 
@@ -578,8 +607,8 @@ def _recognize_table_cell(img, fallback_text):
     return "text", clean_text(fallback_text)
 
 
-def _extract_table_region(problem_img, element, x0, y0, w, h):
-    # pix2text의 표 레이아웃 인식이 준 셀별 bbox/행렬 번호(el.meta['cells'])를
+def _extract_table_region(problem_img, table_meta, x0, y0, w, h):
+    # pix2text의 표 레이아웃 인식이 준 셀별 bbox/행렬 번호(table_meta['cells'])를
     # 이용해 셀 하나하나를 다시 크롭하고 _recognize_table_cell로 다시
     # 읽는다 - pix2text 자체의 표-텍스트 변환(마크다운) 결과는 구조
     # (몇 행 몇 열, 어느 셀이 어느 값)는 정확했지만 한글은 뭉개지고
@@ -589,7 +618,7 @@ def _extract_table_region(problem_img, element, x0, y0, w, h):
     # 반환값이 None이면 셀 구조를 못 뽑은 경우(레이아웃 인식이 TABLE로는
     # 잡았지만 표 파서 자체가 실패한 경우) - 호출한 쪽이 이미지 블록으로
     # 대체 처리한다.
-    cells_meta = (element.meta or {}).get("cells") or []
+    cells_meta = (table_meta or {}).get("cells") or []
     flat_cells = cells_meta[0] if cells_meta else []
     if not flat_cells:
         return None
@@ -677,7 +706,7 @@ def recognize_problem_regions(document, page, problem):
                 segments.extend(_extract_figure_region(x0, y0, w, h))
             mask_boxes.append((x0, y0, w, h))
         elif kind == "table":
-            table_segment = _extract_table_region(problem_img, region["element"], x0, y0, w, h)
+            table_segment = _extract_table_region(problem_img, region["table_meta"], x0, y0, w, h)
             segments.extend(table_segment if table_segment else _extract_figure_region(x0, y0, w, h))
             mask_boxes.append((x0, y0, w, h))
 
