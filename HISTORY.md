@@ -419,7 +419,7 @@
 
 ## 11. OCR 인식 파이프라인 근본 재설계 - 문자 분류에서 레이아웃 분석 기반 통짜 인식으로 (2026-08-07)
 
-`6e19db5` 이후 진행한 작업들 중 11번째 묶음. 커밋 시 이 줄에 실제 해시 반영할 것.
+`839d85d` Rebuild OCR pipeline around layout analysis instead of PDF text-layer classification
 
 **발단: "OCR 결과가 형편없다"**
 - 사용자가 리뷰 화면에서 결과를 보다가 지적. 실제 문제로 파고들어 보니
