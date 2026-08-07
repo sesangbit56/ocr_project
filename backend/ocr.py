@@ -369,6 +369,7 @@ def recognize_scanned_problem_region(problem):
 
     segments = _reading_order(segments)
     segments = extract_choice_labels(segments)
+    segments = expand_choice_glob_segments(segments)
     segments = merge_empty_choice_markers(segments)
     return relabel_choice_row(segments)
 
@@ -380,6 +381,125 @@ def _extract_figure_region(x0, y0, w, h):
     # ProblemContent 행의 id가 없어서 못 하고, recognize_and_save_problem이
     # 행을 만들고 flush한 뒤에 처리한다.
     return [{"type": "image", "label": None, "content": "", "bbox_x": x0, "bbox_y": y0, "bbox_w": w, "bbox_h": h, "confidence": 1.0}]
+
+
+# 레이아웃 분석이 FIGURE로 분류한 영역이라도, 실제로는 선지 다섯 개가
+# 가로로 빽빽하게 늘어선 줄("① 3/2 ② 5/2 ...")인 경우가 실측으로 두
+# 건 확인됐다 - 진짜 도형(삼각형, 그래프 등)과 달리 선지 행은 항상
+# 한 줄 높이 정도로 짧고, 문제 폭 대부분을 가로로 채운다. 처음엔
+# "다시 스캔해서 텍스트/수식으로 덮이는 비율"로 판단하려 했는데,
+# 실측해보니 오히려 거꾸로였다 - 진짜 도형도 삼각형/곡선의 잉크
+# 전체를 감싸는 박스 하나로 인식돼서 커버리지가 더 높게 나왔다. 그래서
+# 모양(짧고 넓적함)만으로 먼저 걸러낸다.
+FIGURE_ROW_MAX_HEIGHT = 70
+FIGURE_ROW_MIN_ASPECT = 4
+
+
+def _figure_region_is_actually_text(problem_img, x0, y0, w, h):
+    # None을 반환하면 진짜 그림이라는 뜻(호출한 쪽이 기존처럼 이미지
+    # 블록으로 처리한다). 텍스트로 뒤집힌 경우엔 좌표를 문제 전체
+    # 기준으로 되돌린 세그먼트 목록을 반환하고, 각 세그먼트에
+    # "_from_figure_row" 표시를 남긴다 - 이 표시는 아래
+    # _rescue_unclaimed_figure_rows에서, 원문자 마커가 엉뚱한 글자로
+    # 읽혀서 relabel_choice_row가 선지로 인정해 줄 발판(anchor)조차
+    # 못 찾은 경우를 구제하는 데 쓰고, 저장 직전에 지운다.
+    if h > FIGURE_ROW_MAX_HEIGHT or w < FIGURE_ROW_MIN_ASPECT * h:
+        return None
+
+    # 세로로 여백을 좀 둘러서 다시 스캔한다 - 원본 높이(27px 사례로
+    # 확인) 그대로 넘기면 검출 모델이 너무 얇다고 보고 아예 박스를
+    # 하나도 못 찾는 경우가 실제로 있었다. 흰 여백을 둘러주면 같은
+    # 줄이 정상적으로 검출된다.
+    pad = 20
+    crop = problem_img.crop((x0, y0, x0 + w, y0 + h))
+    padded = Image.new("RGB", (w, h + pad * 2), "white")
+    padded.paste(crop, (0, pad))
+
+    segments = _recognize_pixel_region(padded)
+    if not segments:
+        return None
+    for seg in segments:
+        seg["bbox_x"] += x0
+        seg["bbox_y"] += y0 - pad
+        seg["_from_figure_row"] = True
+    return segments
+
+
+# 선택지 다섯 개가 한 줄에 촘촘히 붙어 있는 영역만 좁게 크롭해서 다시
+# 읽으면(위 _figure_region_is_actually_text가 그림 오판을 뒤집은
+# 직후처럼), pix2text가 이걸 낱개 박스로 안 쪼개고 "\oplus {3/2}
+# \qquad\oplus {5/2} \qquad..." 식으로 수식 하나에 다 욱여넣는 걸
+# 실측으로 확인했다(원문자 마커는 뜻과 무관한 \oplus 등으로 오독됨).
+# \qquad로 확실히 갈라져 있고 조각마다 순수 명령어 마커로 시작하는
+# 모양일 때만 각 조각을 choice 세그먼트로 되돌린다 - 마커 글리프
+# 자체는 못 믿으므로 라벨은 비워두고, choice 타입으로 바로 만들어두면
+# relabel_choice_row가 x좌표 순으로 ①②③④⑤를 다시 매겨준다.
+_CHOICE_GLOB_ITEM_RE = re.compile(r"^\\[a-zA-Z]+\s*(?:\\[,;:]|\\\s)*\s*(.*)$", re.DOTALL)
+
+
+def expand_choice_glob_segments(segments):
+    result = []
+    for seg in segments:
+        if seg["type"] != "formula":
+            result.append(seg)
+            continue
+        pieces = [p.strip() for p in seg["content"].split(r"\qquad") if p.strip()]
+        if len(pieces) < 3:
+            result.append(seg)
+            continue
+        items = [_CHOICE_GLOB_ITEM_RE.match(p) for p in pieces]
+        if not all(items):
+            result.append(seg)
+            continue
+        slot_w = seg["bbox_w"] / len(pieces)
+        for idx, m in enumerate(items):
+            result.append(
+                {
+                    "type": "choice",
+                    "label": None,
+                    "content": clean_latex(m.group(1)),
+                    "bbox_x": seg["bbox_x"] + round(idx * slot_w),
+                    "bbox_y": seg["bbox_y"],
+                    "bbox_w": round(slot_w),
+                    "bbox_h": seg["bbox_h"],
+                    "confidence": seg["confidence"],
+                }
+            )
+    return result
+
+
+def _rescue_unclaimed_figure_rows(segments):
+    # relabel_choice_row는 "이미 제대로 읽힌 choice가 문제 어딘가에
+    # 하나라도 있다"는 발판(anchor)이 있어야 나머지를 선지로 인정해
+    # 준다. 그런데 그림으로 오판됐다가 되돌아온 선지 행은 원문자
+    # 마커가 "0", "@" 같은 전혀 무관한 글자로 읽히는 경우가 흔해서,
+    # 문제 전체에 그 발판이 하나도 없을 수 있다(실측 사례: "0 117",
+    # "121", "125", ... - 마커를 알아볼 방법이 없다). 하지만 이
+    # 조각들은 애초에 "그림으로 오판될 만큼 짧고 넓적한 영역" 하나에서만
+    # 나왔다는 맥락 자체가 이미 선지 행이라는 강한 증거이므로, 여기까지
+    # 와서도 여전히 choice로 인정받지 못한 _from_figure_row 조각이
+    # 2개 이상 연달아 있으면 마커 인식 여부와 무관하게 그대로 선지로
+    # 확정한다.
+    result = list(segments)
+    i = 0
+    while i < len(result):
+        if not result[i].get("_from_figure_row") or result[i]["type"] == "choice":
+            i += 1
+            continue
+        j = i
+        while j < len(result) and result[j].get("_from_figure_row") and result[j]["type"] != "choice":
+            j += 1
+        run = sorted(result[i:j], key=lambda s: s["bbox_x"])
+        if len(run) >= 2:
+            for position, seg in enumerate(run):
+                stripped = seg["content"].strip()
+                digit_match = re.match(r"^\D*(\d.*)$", stripped)
+                seg["type"] = "choice"
+                seg["content"] = digit_match.group(1) if digit_match else stripped
+                seg["label"] = chr(0x2460 + position) if position < 20 else None
+        result[i:j] = run
+        i = j
+    return result
 
 
 def _recognize_table_cell(img, fallback_text):
@@ -501,11 +621,16 @@ def recognize_problem_regions(document, page, problem):
     problem_img, regions = analyze_problem_layout(problem)
 
     segments = []
+    text_like_segments = []
     mask_boxes = []
     for region in regions:
         kind, x0, y0, w, h = region["kind"], region["x"], region["y"], region["w"], region["h"]
         if kind == "figure":
-            segments.extend(_extract_figure_region(x0, y0, w, h))
+            reclassified = _figure_region_is_actually_text(problem_img, x0, y0, w, h)
+            if reclassified is not None:
+                text_like_segments.extend(reclassified)
+            else:
+                segments.extend(_extract_figure_region(x0, y0, w, h))
             mask_boxes.append((x0, y0, w, h))
         elif kind == "table":
             table_segment = _extract_table_region(problem_img, region["element"], x0, y0, w, h)
@@ -513,13 +638,17 @@ def recognize_problem_regions(document, page, problem):
             mask_boxes.append((x0, y0, w, h))
 
     scan_img = _mask_boxes(problem_img, mask_boxes)
-    rest_segments = _recognize_pixel_region(scan_img)
-    if rest_segments:
-        rest_segments = _reading_order(rest_segments)
-        rest_segments = extract_choice_labels(rest_segments)
-        rest_segments = merge_empty_choice_markers(rest_segments)
-        rest_segments = relabel_choice_row(rest_segments)
-    segments.extend(rest_segments)
+    text_like_segments.extend(_recognize_pixel_region(scan_img))
+    if text_like_segments:
+        text_like_segments = _reading_order(text_like_segments)
+        text_like_segments = extract_choice_labels(text_like_segments)
+        text_like_segments = expand_choice_glob_segments(text_like_segments)
+        text_like_segments = merge_empty_choice_markers(text_like_segments)
+        text_like_segments = relabel_choice_row(text_like_segments)
+        text_like_segments = _rescue_unclaimed_figure_rows(text_like_segments)
+        for seg in text_like_segments:
+            seg.pop("_from_figure_row", None)
+    segments.extend(text_like_segments)
 
     if not segments:
         return [

@@ -12,6 +12,14 @@
       <button class="top-tab" :class="{ active: view === 'review-queue' }" @click="view = 'review-queue'">
         Review Queue ({{ reviewQueueCount }})
       </button>
+      <span
+        class="backend-status"
+        :class="{ offline: !backendOnline }"
+        :title="backendOnline ? 'Backend server is reachable' : 'Backend server is not responding'"
+      >
+        <span class="backend-status-dot"></span>
+        {{ backendOnline ? 'Backend online' : 'Backend offline' }}
+      </span>
       <span class="ocr-status" :class="{ active: ocrStatus.active }" :title="ocrStatusTitle">
         <span class="ocr-status-dot"></span>
         {{ ocrStatusLabel }}
@@ -74,6 +82,7 @@ const selectedPageId = ref(null)
 const regionQueueCount = ref(0)
 const reviewQueueCount = ref(0)
 const ocrStatus = ref({ active: false, current: null, queued: 0 })
+const backendOnline = ref(true)
 // Remembers which view opened the guide, so closing it returns to wherever
 // it was opened from ('review' or 'review-queue') instead of always going
 // back to the standalone review view.
@@ -102,9 +111,14 @@ const fetchOcrStatus = async () => {
   try {
     const response = await fetch('/api/ocr/status')
     ocrStatus.value = await response.json()
+    backendOnline.value = true
   } catch (err) {
     // A transient fetch failure (e.g. dev server restarting) shouldn't
-    // wipe out the last known status - just skip this tick.
+    // wipe out the last known OCR status - just skip this tick. It does
+    // mean the backend is unreachable, though, so flip the status pill -
+    // this is the only signal the UI has that the backend process died
+    // (as opposed to just being idle).
+    backendOnline.value = false
   }
 }
 
@@ -250,11 +264,38 @@ h1 {
   color: #2563eb;
 }
 
-.ocr-status {
+.backend-status {
   display: flex;
   align-items: center;
   gap: 0.4rem;
   margin-left: auto;
+  padding: 0.4rem 0.8rem;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  background: #f3f4f6;
+  color: #6b7280;
+  white-space: nowrap;
+}
+.backend-status.offline {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+.backend-status-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: #22c55e;
+  flex-shrink: 0;
+}
+.backend-status.offline .backend-status-dot {
+  background: #dc2626;
+  animation: ocr-status-pulse 1.2s ease-in-out infinite;
+}
+
+.ocr-status {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
   padding: 0.4rem 0.8rem;
   border-radius: 999px;
   font-size: 0.82rem;
