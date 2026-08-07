@@ -34,6 +34,18 @@ HANGUL_RE = re.compile(r"[가-힣ᄀ-ᇿ㄰-㆏]")
 # 여기 보탤 게 없고 오히려 환각(hallucination) 위험만 초래한다.
 CHOICE_LABEL_RE = re.compile(r"^([①-⑳])\s*(.*)$")
 
+# 원문자를 못 읽고 대신 LaTeX 명령어로 오독하는 경우도 흔하다 - 실제로
+# \textcircled{...}(원문자를 통째로 명령어화)와 \oplus/\ominus/\otimes/
+# \odot(원 안에 기호가 든 수학 연산자들 - 원문자와 생김새가 비슷해서
+# 오독되는 것으로 보임) 전부 확인했다. LATEX_CIRCLE_MARKER_RE는 문자열
+# 어디에 있든 이런 마커를 찾는 데 쓰고(_looks_broken - 맨 앞이 아닌
+# 곳에 있으면 선지 두 개가 한 박스에 뭉친 신호), LATEX_CIRCLE_MARKER_ITEM_RE는
+# 맨 앞에 있는 것만 추출해서 실제로 마커를 떼어내는 데 쓴다(extract_choice_labels).
+LATEX_CIRCLE_MARKER_RE = re.compile(r"\\(?:textcircled\{[^{}]*\}|oplus|ominus|otimes|odot)")
+LATEX_CIRCLE_MARKER_ITEM_RE = re.compile(
+    r"^\\(?:textcircled\{[^{}]*\}|oplus|ominus|otimes|odot)\s*(?:\\[,;:]|\\\s)*\s*(.*)$", re.DOTALL
+)
+
 # 표준 객관식 세트는 항상 정확히 이 5개 선택지로 구성된다 - 인식된 선택지
 # 그룹에 일부가 빠져 있을 때(recognize_and_save_problem 참고) 검토자가
 # 빈틈을 알아채고 손으로 추가하게 두는 대신, 여기서 바로 채워 넣는 데 쓴다.
@@ -41,11 +53,12 @@ STANDARD_CHOICE_LABELS = ["①", "②", "③", "④", "⑤"]
 
 
 def extract_choice_labels(segments):
-    # formula 또는 text 세그먼트 앞에 붙은 원문자 하나를 떼어내서 자기만의
-    # label로 만들고, 타입을 "choice"로 바꾼다. formula/text 두 타입을 다
-    # 검사하는 이유는, pix2text의 박스 분류("isolated"/"embedding" ->
-    # formula, 그 외 -> text)가 원문자를 어느 쪽으로 볼지 상황에 따라
-    # 갈리기 때문이다.
+    # formula 또는 text 세그먼트 앞에 붙은 원문자 하나(또는 원문자를
+    # 잘못 읽은 LaTeX 마커 명령어)를 떼어내서 자기만의 label로 만들고,
+    # 타입을 "choice"로 바꾼다. formula/text 두 타입을 다 검사하는
+    # 이유는, pix2text의 박스 분류("isolated"/"embedding" -> formula,
+    # 그 외 -> text)가 원문자를 어느 쪽으로 볼지 상황에 따라 갈리기
+    # 때문이다.
     result = []
     for seg in segments:
         if seg["type"] in ("formula", "text"):
@@ -57,6 +70,15 @@ def extract_choice_labels(segments):
                     "label": match.group(1),
                     "content": match.group(2),
                 }
+            else:
+                marker_match = LATEX_CIRCLE_MARKER_ITEM_RE.match(seg["content"])
+                if marker_match:
+                    seg = {
+                        **seg,
+                        "type": "choice",
+                        "label": None,
+                        "content": marker_match.group(1),
+                    }
         result.append(seg)
     return result
 
@@ -417,7 +439,7 @@ def _recognize_pixel_region(img):
                 "confidence": round(confidence, 2),
             }
         )
-    return _fix_array_hallucinations(img, segments)
+    return _fix_broken_formula_segments(img, segments)
 
 
 # 선지 다섯 개가 한 줄에 촘촘히 붙어있는 영역을 통짜로 넣으면, MFR이 가끔
@@ -430,15 +452,35 @@ def _recognize_pixel_region(img):
 # 있으면 사실상 100% 이 환각으로 봐도 된다.
 ARRAY_HALLUCINATION_RE = re.compile(r"\\begin\{array\}")
 
+# 선지 줄이 (그림이 아니라) 애초에 "formula"로 레이아웃 분류되는 경우도
+# 있는데, 이럴 땐 MFD가 박스 경계 자체를 잘못 잡아 선지 두 개를 박스
+# 하나에 합쳐버리는 걸 실측으로 확인했다(예: "-\frac{2\sqrt{5}}{5}
+# \quad\textcircled{3}-\frac{\nu}{\lambda}" - 앞 선지 값 뒤에 다음 선지의
+# 마커+엉뚱한 값이 그대로 붙어 나옴). 정상적인 선지 인식이라면
+# LATEX_CIRCLE_MARKER_RE(모듈 위쪽에 정의) 마커는 그 박스 내용의 맨
+# 앞에 딱 하나만 있어야 한다 - 두 개 이상이거나 맨 앞이 아닌 곳에 끼어
+# 있으면 박스 하나에 선지가 여러 개 뭉친 것으로 본다.
+
 # 이 너비보다 좁아지면 반으로 쪼개봐야 원래도 좁았던 영역이라 의미가
 # 없다고 보고 재시도를 포기한다 - 무한정 쪼개려 드는 것도 막는다.
-_ARRAY_RETRY_MIN_WIDTH = 40
+_SPLIT_RETRY_MIN_WIDTH = 40
 
 
-def _fix_array_hallucinations(img, segments):
+def _looks_broken(content):
+    if ARRAY_HALLUCINATION_RE.search(content):
+        return True
+    markers = list(LATEX_CIRCLE_MARKER_RE.finditer(content))
+    if not markers:
+        return False
+    if len(markers) > 1:
+        return True
+    return markers[0].start() != 0
+
+
+def _fix_broken_formula_segments(img, segments):
     result = []
     for seg in segments:
-        if seg["type"] == "formula" and ARRAY_HALLUCINATION_RE.search(seg["content"]):
+        if seg["type"] == "formula" and _looks_broken(seg["content"]):
             retried = _retry_split_region(img, seg)
             if retried is not None:
                 result.extend(retried)
@@ -448,17 +490,17 @@ def _fix_array_hallucinations(img, segments):
 
 
 def _retry_split_region(img, seg):
-    # 같은 크롭을 그대로 다시 넣으면 모델이 결정론적이라 똑같은 환각이
-    # 또 나올 뿐이다 - 대신 영역을 좌우로 반씩 쪼개서 각각 따로 인식시킨다.
-    # 선지 다섯 개가 한꺼번에 보여서 표처럼 착각하는 게 원인으로 보이니,
-    # 한 번에 보여주는 항목 수를 줄이면(반쪽엔 2~3개만) 그 착시를 피할
+    # 같은 크롭을 그대로 다시 넣으면 모델이 결정론적이라 똑같이 망가진
+    # 결과가 또 나올 뿐이다 - 대신 영역을 좌우로 반씩 쪼개서 각각 따로
+    # 인식시킨다. 선지 여러 개가 한꺼번에 보이는 게 원인으로 보이니,
+    # 한 번에 보여주는 항목 수를 줄이면(반쪽엔 절반만) 그 문제를 피할
     # 가능성이 높다 - _figure_region_is_actually_text가 "좁게 잘라서
     # 다시 보여주면 더 잘 읽는다"는 걸 이미 확인한 것과 같은 원리다.
-    # 재시도 결과에도 여전히 환각이 남아있으면(반쪽도 여전히 복잡한
-    # 경우) None을 돌려줘서 호출한 쪽이 원본을 그대로 쓰게 한다 -
-    # 어차피 이미 망가진 값이라 더 나빠질 것도 없다.
+    # 재시도 결과에도 여전히 망가진 게 남아있으면 None을 돌려줘서 호출한
+    # 쪽이 원본을 그대로 쓰게 한다 - 어차피 이미 망가진 값이라 더
+    # 나빠질 것도 없다.
     x0, y0, w, h = seg["bbox_x"], seg["bbox_y"], seg["bbox_w"], seg["bbox_h"]
-    if w < _ARRAY_RETRY_MIN_WIDTH:
+    if w < _SPLIT_RETRY_MIN_WIDTH:
         return None
 
     mid = w // 2
@@ -475,7 +517,7 @@ def _retry_split_region(img, seg):
         s["bbox_y"] += y0
 
     combined = left_segments + right_segments
-    if any(s["type"] == "formula" and ARRAY_HALLUCINATION_RE.search(s["content"]) for s in combined):
+    if any(s["type"] == "formula" and _looks_broken(s["content"]) for s in combined):
         return None
     return combined
 
@@ -1035,68 +1077,19 @@ def recognize_and_save_problem(document, page, problem):
     ProblemContent.query.filter_by(problem_id=problem.id).delete()
     contents = []
     top_level_index = 0
-    i = 0
-    while i < len(segments):
-        run_end = i
-        if segments[i]["type"] == "choice":
-            while run_end < len(segments) and segments[run_end]["type"] == "choice":
-                run_end += 1
 
-        # 연속된 choice가 2개 이상이면 무관한 행 N개가 아니라 하나의
-        # 객관식 세트로 본다 - 검토자가 "Group selected"로 손수 묶는
-        # 것과 똑같은 방식으로 자동으로 묶어준다. choice가 하나뿐이면
-        # 그건 무엇의 "세트"도 아니므로 묶지 않고 그대로 둔다.
-        if run_end - i >= 2:
-            group = ProblemContent(
-                problem_id=problem.id,
-                parent_content_id=None,
-                order_index=top_level_index,
-                type="group",
-                label="Choices",
-            )
-            db.session.add(group)
-            db.session.flush()  # 자식이 참조할 수 있으려면 먼저 group.id가 필요하다
-            contents.append(group)
-            top_level_index += 1
+    # choice 세그먼트를 먼저 전부 뽑아내고 나머지를 원래 순서대로 저장한
+    # 다음, choice들은 맨 마지막에 그룹으로 묶는다 - 예전엔 "읽기 순서상
+    # 서로 바로 붙어있는 choice만" 그룹으로 봤는데, 그 사이에 엉뚱한 조각
+    # 하나만 끼어도(오인식으로 흔히 생김) 그룹이 쪼개져서 뒤쪽 선택지들이
+    # 일반 블록으로 떨어져 나가는 문제가 있었다. choice는 문제 안에서
+    # 어디 있었든 상관없이 항상 하나의 "선택지 세트"이므로, 위치 관계와
+    # 무관하게 전부 모아서 묶는다.
+    choice_segments = [seg for seg in segments if seg["type"] == "choice"]
+    other_segments = [seg for seg in segments if seg["type"] != "choice"]
 
-            child_segments = segments[i:run_end]
-            for child_index, seg in enumerate(child_segments):
-                content = _content_from_segment(problem.id, seg, group.id, child_index)
-                db.session.add(content)
-                contents.append(content)
-
-            # 객관식 세트는 항상 정확히 5개의 선택지를 갖는다 - OCR이
-            # 일부만 잡아냈다면(라벨 오독이나, ㄱ/ㄴ/ㄷ 같은 낮은
-            # 신뢰도의 단일 자모 값이 흔한 실패 사례다), 검토자가
-            # 빈틈을 알아채고 손으로 추가하게 두는 대신, 나머지를
-            # 빈 placeholder로 채워서 검토자가 처음부터 완전한
-            # ①-⑤ 세트로 시작하게 한다.
-            detected_labels = {seg.get("label") for seg in child_segments}
-            next_index = len(child_segments)
-            for label in STANDARD_CHOICE_LABELS:
-                if label in detected_labels:
-                    continue
-                placeholder = ProblemContent(
-                    problem_id=problem.id,
-                    parent_content_id=group.id,
-                    order_index=next_index,
-                    type="choice",
-                    label=label,
-                    content="",
-                    bbox_x=0,
-                    bbox_y=0,
-                    bbox_w=min(60, problem.w),
-                    bbox_h=min(30, problem.h),
-                    confidence=None,
-                )
-                db.session.add(placeholder)
-                contents.append(placeholder)
-                next_index += 1
-
-            i = run_end
-            continue
-
-        content = _content_from_segment(problem.id, segments[i], None, top_level_index)
+    for seg in other_segments:
+        content = _content_from_segment(problem.id, seg, None, top_level_index)
         db.session.add(content)
         if content.type == "image":
             # 자동 검출된 그림(FIGURE) 영역 - _extract_figure_region은
@@ -1108,7 +1101,61 @@ def recognize_and_save_problem(document, page, problem):
             )
         contents.append(content)
         top_level_index += 1
-        i += 1
+
+    # choice가 2개 이상이면 무관한 행 N개가 아니라 하나의 객관식 세트로
+    # 본다 - 검토자가 "Group selected"로 손수 묶는 것과 똑같은 방식으로
+    # 자동으로 묶어준다. choice가 하나뿐이면 그건 무엇의 "세트"도 아니므로
+    # 묶지 않고 그대로 둔다.
+    if len(choice_segments) >= 2:
+        group = ProblemContent(
+            problem_id=problem.id,
+            parent_content_id=None,
+            order_index=top_level_index,
+            type="group",
+            label="Choices",
+        )
+        db.session.add(group)
+        db.session.flush()  # 자식이 참조할 수 있으려면 먼저 group.id가 필요하다
+        contents.append(group)
+        top_level_index += 1
+
+        for child_index, seg in enumerate(choice_segments):
+            content = _content_from_segment(problem.id, seg, group.id, child_index)
+            db.session.add(content)
+            contents.append(content)
+
+        # 객관식 세트는 항상 정확히 5개의 선택지를 갖는다 - OCR이
+        # 일부만 잡아냈다면(라벨 오독이나, ㄱ/ㄴ/ㄷ 같은 낮은
+        # 신뢰도의 단일 자모 값이 흔한 실패 사례다), 검토자가
+        # 빈틈을 알아채고 손으로 추가하게 두는 대신, 나머지를
+        # 빈 placeholder로 채워서 검토자가 처음부터 완전한
+        # ①-⑤ 세트로 시작하게 한다.
+        detected_labels = {seg.get("label") for seg in choice_segments}
+        next_index = len(choice_segments)
+        for label in STANDARD_CHOICE_LABELS:
+            if label in detected_labels:
+                continue
+            placeholder = ProblemContent(
+                problem_id=problem.id,
+                parent_content_id=group.id,
+                order_index=next_index,
+                type="choice",
+                label=label,
+                content="",
+                bbox_x=0,
+                bbox_y=0,
+                bbox_w=min(60, problem.w),
+                bbox_h=min(30, problem.h),
+                confidence=None,
+            )
+            db.session.add(placeholder)
+            contents.append(placeholder)
+            next_index += 1
+    elif len(choice_segments) == 1:
+        content = _content_from_segment(problem.id, choice_segments[0], None, top_level_index)
+        db.session.add(content)
+        contents.append(content)
+        top_level_index += 1
 
     problem.status = "recognized"
 

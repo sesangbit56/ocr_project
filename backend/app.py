@@ -804,6 +804,13 @@ def create_problem_content(problem_id):
         parent = ProblemContent.query.filter_by(id=parent_content_id, problem_id=problem_id, type="group").first()
         if parent is None:
             return jsonify({"error": "parent_content_id must reference a group in this problem"}), 400
+    elif content_type == "choice":
+        # "+ Choice" doesn't ask the caller for a parent - a manually added
+        # choice belongs in the Choices group the same as any other choice,
+        # so route it there automatically (creating the group if this is
+        # the problem's first choice) rather than leaving it stranded as a
+        # top-level row like set_content_type already avoids doing.
+        parent_content_id = _get_or_create_choices_group(problem_id).id
 
     # Optional: place the new row right after a specific sibling (the
     # reviewer's last-focused row) instead of always appending at the end -
@@ -1140,6 +1147,29 @@ def ungroup_problem_content(group_id):
 EDITABLE_CONTENT_TYPES = {"text", "formula", "choice", "image"}
 
 
+def _get_or_create_choices_group(problem_id):
+    """The one Choices group a problem can have, creating it (appended after
+    whatever's currently at the top level) if this is the first choice row
+    to need it. Shared by set_content_type and create_problem_content, which
+    both have to route a row into the group rather than leave it stranded
+    as a top-level choice."""
+    choices_group = ProblemContent.query.filter_by(
+        problem_id=problem_id, parent_content_id=None, type="group", label="Choices"
+    ).first()
+    if choices_group is None:
+        top_level_count = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=None).count()
+        choices_group = ProblemContent(
+            problem_id=problem_id,
+            parent_content_id=None,
+            order_index=top_level_count,
+            type="group",
+            label="Choices",
+        )
+        db.session.add(choices_group)
+        db.session.flush()
+    return choices_group
+
+
 @app.route("/api/problem_contents/<uuid:content_id>/type", methods=["POST"])
 def set_content_type(content_id):
     """Changing a row to/from type="choice" also has to move it in or out of
@@ -1167,16 +1197,7 @@ def set_content_type(content_id):
 
     if new_type == "choice":
         if choices_group is None:
-            top_level_count = ProblemContent.query.filter_by(problem_id=problem_id, parent_content_id=None).count()
-            choices_group = ProblemContent(
-                problem_id=problem_id,
-                parent_content_id=None,
-                order_index=top_level_count,
-                type="group",
-                label="Choices",
-            )
-            db.session.add(choices_group)
-            db.session.flush()
+            choices_group = _get_or_create_choices_group(problem_id)
         if content.parent_content_id != choices_group.id:
             sibling_count = ProblemContent.query.filter_by(
                 problem_id=problem_id, parent_content_id=choices_group.id
