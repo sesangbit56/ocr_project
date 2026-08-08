@@ -548,7 +548,8 @@ def recognize_scanned_problem_region(problem):
     segments = extract_choice_labels(segments)
     segments = expand_choice_glob_segments(segments)
     segments = merge_empty_choice_markers(segments)
-    return relabel_choice_row(segments)
+    segments = relabel_choice_row(segments)
+    return _rescue_choiceless_row(segments)
 
 
 def _extract_figure_region(x0, y0, w, h):
@@ -691,6 +692,52 @@ def _rescue_unclaimed_figure_rows(segments):
         result[i:j] = run
         i = j
     return result
+
+
+def _rescue_choiceless_row(segments):
+    # relabel_choice_row는 "이미 제대로 읽힌 choice가 문제 어딘가에
+    # 하나라도 있다"는 발판(anchor)이 있어야 나머지를 선지로 인정해
+    # 준다. 그런데 원문자 마커가 원문자도 LaTeX 마커 명령어도 아닌
+    # "0", "2", "a" 같은 전혀 무관한 문자/숫자로 오독되면(extract_choice_labels가
+    # 못 잡는 형태), 선지 박스 자체는 5개 다 멀쩡히 검출되고 값도 전부
+    # 정확한데(예: `\frac{7}{12}` 등) 그 발판이 아예 하나도 안 생겨서
+    # relabel_choice_row가 통째로 포기해버리는 경우를 실측으로 확인했다.
+    # 이미 choice가 하나라도 있으면 이 함수는 손대지 않는다 -
+    # relabel_choice_row가 이미 잘 처리했다는 뜻이므로.
+    #
+    # 짧은(2글자 이하) text 세그먼트가 같은 행에 3개 이상 모여 있으면
+    # 선지 마커 후보로 본다 - 문제 본문에 우연히 등장하는 짧은 변수명
+    # 한둘로는 이 조건(같은 행에 3개 이상)을 채우기 어려우므로 오탐
+    # 위험이 낮다. 후보 전부를 내용이 빈 choice로 만들어서
+    # merge_empty_choice_markers(빈 choice를 바로 다음 같은 행 세그먼트와
+    # 병합)와 relabel_choice_row(x좌표 순 재라벨링)가 나머지를 기존
+    # 로직 그대로 처리하게 한다.
+    if any(s["type"] == "choice" for s in segments):
+        return segments
+
+    short_indices = [i for i, s in enumerate(segments) if s["type"] == "text" and len(s["content"].strip()) <= 2]
+    if len(short_indices) < 3:
+        return segments
+
+    groups = []
+    for i in short_indices:
+        for group in groups:
+            if _rows_overlap(segments[group[0]], segments[i]):
+                group.append(i)
+                break
+        else:
+            groups.append([i])
+    best_group = max(groups, key=len)
+    if len(best_group) < 3:
+        return segments
+
+    marker_indices = set(best_group)
+    segments = [
+        {**seg, "type": "choice", "label": None, "content": ""} if i in marker_indices else seg
+        for i, seg in enumerate(segments)
+    ]
+    segments = merge_empty_choice_markers(segments)
+    return relabel_choice_row(segments)
 
 
 def _recognize_table_cell(img, fallback_text):
@@ -837,6 +884,7 @@ def recognize_problem_regions(document, page, problem):
         text_like_segments = merge_empty_choice_markers(text_like_segments)
         text_like_segments = relabel_choice_row(text_like_segments)
         text_like_segments = _rescue_unclaimed_figure_rows(text_like_segments)
+        text_like_segments = _rescue_choiceless_row(text_like_segments)
         for seg in text_like_segments:
             seg.pop("_from_figure_row", None)
     segments.extend(text_like_segments)
